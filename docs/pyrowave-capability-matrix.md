@@ -13,6 +13,12 @@ capture, conversion, encoding, transport, and decoding. No new execution tests
 are recorded by this audit. The earlier SDR validation reports remain evidence
 for their original scope only.
 
+Current requested scope: **Windows server only**. The Linux/macOS inventory and
+compile results below are historical context; completing or qualifying those
+platforms is future work outside this objective. The production client is also
+a subsequent phase. Windows implementation coverage and Windows qualification
+must be assessed independently of those future platform tasks.
+
 ## Source inventory
 
 Primary sources at the audited revision:
@@ -57,13 +63,13 @@ The last column states the remaining qualification or implementation boundary.
 | Device identity / sync | UUID/LUID, external images/semaphores | Windows LUID contexts and NT texture/fence sharing; Linux UUID-selected upload contexts; Metal default GPU identity | New lifetime/failure/adapter-switch evidence needed |
 | Multiple sessions / GPUs | Multiple objects with external call synchronization | Windows per-LUID and Linux per-selector contexts; serialized C API access; independent session encoders; Metal shared default device | Concurrent throughput, resource pressure, and multiple actual GPUs are not qualified by object creation |
 
-## Platform coverage and evidence
+## Platform coverage and evidence (Windows in scope)
 
 | Platform path | Captured source and conversion | Supported profile paths | Evidence and limits |
 | --- | --- | --- | --- |
-| Windows D3D11 → Vulkan | SDR BGRA8 or HDR FP16/scRGB; GPU conversion into shared Y/CbCr targets | All 128 values subject to adapter/image/memory admission | Prior SDR v1 evidence remains valid only for its recorded build; new HDR/4:4:4/precision/partial paths require qualification |
-| Linux system memory → Vulkan | Portable BGRA8 SDR conversion/upload; restricted KMS HDR readback into BGRA16 PQ/BT.2020 | All 128 values subject to backend and GPU admission | Native Linux library and selected C++ objects have compile-only records; this is not a linked or GPU-qualified Linux server |
-| macOS AVFoundation → Metal | AVFoundation explicitly supplies SDR BGRA8, followed by CPU conversion/upload | 64 p8 profiles, including PQ output generated from SDR | Native HDR capture is not implemented in this path. PQ output does not recover highlights/gamut absent from SDR capture; p16 is rejected. No Apple compiler/hardware execution evidence |
+| Windows D3D11 → Vulkan | SDR BGRA8 or HDR FP16/scRGB; GPU conversion into shared Y/CbCr targets | All 128 values subject to adapter/image/memory admission | Extended host builds with PyroWave ON and OFF both link successfully, exit 0. Prior SDR v1 execution evidence retains its original scope; new HDR/4:4:4/precision/partial paths require qualification |
+| Linux system memory → Vulkan | Portable BGRA8 SDR conversion/upload; restricted KMS HDR readback into BGRA16 PQ/BT.2020 | All 128 values subject to backend and GPU admission | Native library and six C++ objects compile successfully, including KMS and the CPU device; this is not a linked or GPU-qualified Linux server |
+| macOS AVFoundation → Metal | AVFoundation explicitly supplies SDR BGRA8, followed by CPU conversion/upload | 64 p8 profiles, including PQ output generated from SDR | Metal library compiled and linked in Apple Silicon CI; host compilation stopped on an unrelated `nvhttp.cpp` helper declaration. Native HDR capture and p16 are not implemented; PQ output does not recover highlights/gamut absent from SDR. No Metal device execution evidence |
 
 Linux KMS accepts HDR only when it can identify the captured framebuffer as
 normalized RGB10 with SMPTE ST 2084 metadata, explicit `BT2020_RGB` connector
@@ -75,14 +81,20 @@ the premultiplied sRGB cursor through linear BT.709/BT.2020 before PQ blending a
 80-nit SDR white. This restriction follows the distinction between framebuffer
 data and connector output in the [DRM color-management contract](https://cdn.kernel.org/doc/html/latest/gpu/drm-kms.html).
 
-Compile records are stored under `build/pyrowave-linux-compile/`: the patched
-upstream Vulkan library linked in 59 Ninja steps, and the color converter,
-portable runtime, protocol, and negotiation translation units have successful
-GCC 12 C++23 object-build records. Consult the source/patch identity in those
-records when comparing later edits. No executable, GPU, unit, or network test
-was run for this audit. Full Linux host dependencies and any additional object
-build results are recorded separately in that directory. The old SDR reports
-do not qualify the new platform paths.
+Compile records are summarized in [the extension build report](pyrowave-extension-build.md).
+Windows ON/OFF host builds both completed with exit 0. Under
+`build/pyrowave-linux-compile/`, the patched upstream Vulkan library linked in
+59 Ninja steps; KMS capture, the CPU encoder device, the color converter,
+portable runtime, protocol, and negotiation all have successful GCC 12 C++23
+object-build records. The final four independent units emitted no warnings;
+KMS/CPU-device warnings are attributed to shared headers and preexisting KMS
+lines. Consult the source/patch identities in those records when comparing later
+edits. The [first Apple Silicon CI job](https://github.com/Daviex/Vibepollo/actions/runs/35857794571/job/107170376071)
+compiled and linked the Metal shared library, then failed while compiling the
+host because `has_stream_session_activity` was undeclared in `nvhttp.cpp`.
+That run provides no successful macOS host link. No executable, GPU, unit, or
+network test was run for this audit. The old SDR reports do not qualify the new
+platform paths.
 
 ## Profile contract implemented in the extension
 
@@ -188,17 +200,17 @@ silently narrowed to color-profile support:
 | External image formats / component swizzles | Ways of supplying the same three sampled component planes | Windows chooses separate Y/CbCr shared textures; portable paths upload converted planes. Supporting every external handle type is not required to express a profile; direct NV12 import previously failed the local chroma oracle |
 | Compute and fragment decoders | Client decoding paths; fragment path is intended for some mobile GPUs | Existing reference tools cover their recorded SDR scope. New profile/partial output and production client decoder selection remain unqualified and part of the subsequent client phase |
 | Partial decode policy and active-block readiness | Client decision of when to present an incomplete frame | Server metadata, fragmentation, and bounded reference reassembly are implemented. Client queue lifetime, presentation policy, and actual partial GPU decode remain next |
-| Metal encoder/decoder, IOSurface import | Separate Apple backend, with its own API and GPU requirements | macOS server has an AVFoundation SDR capture, CPU conversion, and optional Metal p8 runtime path for the default Apple7+ GPU. Native HDR capture, p16, direct IOSurface import, Apple build/hardware qualification, and a client are not completed |
+| Metal encoder/decoder, IOSurface import | Separate Apple backend, with its own API and GPU requirements | macOS server has an AVFoundation SDR capture, CPU conversion, and optional Metal p8 runtime path for the default Apple7+ GPU. The Metal library compiles/links in CI. Native HDR capture, p16, direct IOSurface import, full-host compilation/hardware qualification, and a client are not completed |
 | Linux / Android Vulkan builds | Other library build targets and external-memory integrations | Linux system-memory capture/upload and UUID-selected Vulkan contexts are implemented, with restrictive KMS HDR support. Native library/object compilation is recorded separately; full Linux execution and Android integration are not established |
 | Encoder/decoder CLI, viewer, evaluator, PSNR tools, benchmark, sample capture | Developer/reference programs | Useful validation tools rather than negotiated codec modes. Their existence is inventoried without treating packaging every sample application as a streaming feature |
 | Debug pre-transformed encode / wavelet inspection | Internal C++ research hooks | Not exposed as a product stream mode; any use needs a separate purpose and validation |
 
-The server extension can claim qualified coverage only for rows and platforms
-with both implementation and corresponding evidence. Client functionality,
-native source capture, input precision, and platform qualification remain
-separate boundaries even when the same output profile name is accepted.
+The Windows server extension can claim qualified coverage only for rows with
+both Windows implementation and corresponding evidence. Client functionality
+and future platform work remain separate from the current implementation
+objective even when the same output profile name is accepted elsewhere.
 
-## Verification still required for the extension
+## Verification still required for the Windows extension
 
 - Exhaustive round-trip parsing and negotiation for all 128 profile values,
   plus malformed names, v1 compatibility, field conflicts, and unknown versions.
@@ -212,7 +224,9 @@ separate boundaries even when the same output profile name is accepted.
 - Runtime bitrate changes, sustained per-frame byte ceilings, encrypted and
   unencrypted transport, loss/reordering/duplicates, critical-band sideband,
   partial recovery, and backwards compatibility.
-- Build feature ON/OFF, missing/incompatible runtime, allocation faults,
-  repeated teardown, and resource lifetime checks for the newly used formats.
-- Effective internal precision and queue settings in diagnostics, with any
-  unavailable hardware or platform qualification stated explicitly.
+- Windows ON/OFF builds already have compile evidence; missing/incompatible
+  runtime, allocation faults, repeated teardown, and resource lifetime checks
+  for the new formats still require execution evidence.
+- Effective internal precision and queue settings in Windows diagnostics, with
+  unavailable hardware qualification stated explicitly. Linux/macOS work is
+  outside this acceptance list.

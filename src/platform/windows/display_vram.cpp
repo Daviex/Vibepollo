@@ -531,9 +531,9 @@ namespace platf::dxgi {
 
       auto &img = (img_d3d_t &) img_base;
 #ifdef SUNSHINE_ENABLE_PYROWAVE
-      if (pyrowave_profile && !img.blank && img.format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+      if (pyrowave_profile && !img.blank && img.format != DXGI_FORMAT_B8G8R8A8_UNORM && img.format != DXGI_FORMAT_B8G8R8X8_UNORM &&
           img.format != DXGI_FORMAT_R8G8B8A8_UNORM && img.format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
-        BOOST_LOG(error) << "PyroWave: capture format is not BGRA8, RGBA8 or linear scRGB FP16";
+        BOOST_LOG(error) << "PyroWave: capture format is not BGRA8, BGRX8, RGBA8 or linear scRGB FP16";
         return -1;
       }
 #endif

@@ -1,20 +1,10 @@
 ---
-name: PyroWave macOS build
+name: Optional PyroWave Linux and macOS builds
 
 # Opt-in compilation only. This workflow does not run the host or GPU tests,
 # install the application, sign/notarize it, or publish a release.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - codex/pyrowave-server
-    paths:
-      - .github/workflows/pyrowave-build.yml
-      - CMakeLists.txt
-      - cmake/**
-      - src/**
-      - src_assets/**
-      - third-party/**
 
 permissions:
   contents: read

@@ -5,6 +5,10 @@ profile and partial-frame transport implementation. The original SDR 4:2:0
 qualification is historical evidence for commit `205c510c`; it does not qualify
 HDR, 4:4:4, transport v2, concurrency or the new platform backends.
 
+The current server delivery targets **Windows only**, as explicitly requested
+by the user. Linux and macOS code and compile records are retained as deferred,
+experimental work and do not define client acceptance requirements for this phase.
+
 ## Sources of truth
 
 | Concern | Reference |

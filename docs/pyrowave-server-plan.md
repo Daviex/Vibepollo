@@ -10,6 +10,11 @@ Integrare PyroWave nel server VibePollo come codec sperimentale opzionale, prepa
 
 La richiesta successiva amplia l'obiettivo a tutte le capacità attualmente offerte da PyroWave. Il confronto con upstream conferma che `master` coincide ancora con il pin `d2997ac172bdc00e29c58e3f2938acb7e94580bf`. La [matrice delle capacità](pyrowave-capability-matrix.md) registra funzionalità, prove disponibili e lavoro ancora aperto. Le evidenze della prima fase riportate sotto riguardano **SDR 4:2:0** e non qualificano automaticamente i nuovi percorsi.
 
+**Perimetro aggiornato dall'utente: solo server Windows.** Linux/ARM e macOS
+sono rinviati; il codice e le evidenze già prodotti restano sperimentali. Le loro
+attività sono tornate in To-Do e non bloccano la consegna Windows. Le relative
+build GitHub sono disponibili solo su avvio manuale.
+
 Il piano operativo aggiunto in **Vikunja → VibePollo → PyroWave — Server** è:
 
 | Attività | ID Vikunja | Risultato richiesto |
@@ -23,11 +28,11 @@ Il piano operativo aggiunto in **Vikunja → VibePollo → PyroWave — Server**
 | PW-X06 | 173 | Frammenti nativi, recupero parziale e protezione dei dati critici |
 | PW-X07 | 174 | Precisione wavelet configurabile e diagnostica GPU |
 | PW-X08 | 175 | Contesti per adattatore e più encoder |
-| PW-X09 | 176 | Backend host Linux/ARM Vulkan |
-| PW-X10 | 177 | Backend host macOS Metal con capacità specifiche upstream |
+| PW-X09 | 176 | Rinviato: backend host Linux/ARM Vulkan, fuori ambito corrente |
+| PW-X10 | 177 | Rinviato: backend host macOS Metal, fuori ambito corrente |
 | PW-X11 | 178 | Build, documentazione, packaging e audit finale della copertura |
 
-La prima sequenza di lavoro è X00 → X01 → X02/X03 → X04; X05 e X06 estendono il trasporto, X07/X08 il runtime. I backend X09/X10 devono pubblicare le proprie capacità effettive. X11 dipende dall'intero inventario: attività incomplete e hardware non qualificato restano visibili. Il client applicativo continua a essere la fase successiva; contratto e dati di riferimento sono parte del lavoro server.
+La prima sequenza di lavoro è X00 → X01 → X02/X03 → X04; X05 e X06 estendono il trasporto, X07/X08 il runtime. X11 dipende dalle attività Windows: X09/X10 sono stati rimossi dai suoi prerequisiti su indicazione dell'utente. Attività incomplete e hardware non qualificato restano visibili. Il client applicativo continua a essere la fase successiva; contratto e dati di riferimento sono parte del lavoro server.
 
 ### Prima fase sperimentale — baseline storica
 
