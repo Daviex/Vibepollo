@@ -6,7 +6,7 @@ Data: 23 settembre 2026. Baseline VibePollo analizzata: `8bf0ef7d3dbc0402e553deb
 
 Integrare PyroWave nel server VibePollo come codec sperimentale opzionale, preparandone il contratto per il successivo sviluppo del client.
 
-### Estensione completa richiesta il 23 settembre 2026 — in corso
+### Estensione richiesta il 23 settembre 2026 — implementata su Windows, qualifica aperta
 
 La richiesta successiva amplia l'obiettivo a tutte le capacità attualmente offerte da PyroWave. Il confronto con upstream conferma che `master` coincide ancora con il pin `d2997ac172bdc00e29c58e3f2938acb7e94580bf`. La [matrice delle capacità](pyrowave-capability-matrix.md) registra funzionalità, prove disponibili e lavoro ancora aperto. Le evidenze della prima fase riportate sotto riguardano **SDR 4:2:0** e non qualificano automaticamente i nuovi percorsi.
 
@@ -14,6 +14,14 @@ La richiesta successiva amplia l'obiettivo a tutte le capacità attualmente offe
 sono rinviati; il codice e le evidenze già prodotti restano sperimentali. Le loro
 attività sono tornate in To-Do e non bloccano la consegna Windows. Le relative
 build GitHub sono disponibili solo su avvio manuale.
+
+Il codice Windows esteso è consegnato sul branch `codex/pyrowave-server`:
+profili 4:2:0/4:4:4, p8/p16, HDR PQ e campi colore indipendenti, bitrate live,
+trasporto v2 con recupero parziale/FEC differenziata, precisione wavelet,
+statistiche e contesti per GPU. Il [report di build](pyrowave-extension-build.md)
+identifica log e pacchetto. Le attività di qualifica hardware/streaming restano
+aperte in Vikunja; la compilazione non viene presentata come prova dei nuovi
+profili su GPU.
 
 Il piano operativo aggiunto in **Vikunja → VibePollo → PyroWave — Server** è:
 

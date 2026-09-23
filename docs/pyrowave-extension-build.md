@@ -30,8 +30,8 @@ Metal has its own input limits; see the capability matrix.
 | Artifact | Result | Evidence and scope |
 | --- | --- | --- |
 | Windows PyroWave shared library | PASS | Final patched dependency compiled as part of the host build |
-| Windows host, PyroWave ON | PASS, exit 0 | Final portability rebuild: `build/pyrowave-server-on/extension-build-latest.log`, including the `sunshine.exe` link |
-| Windows host, PyroWave OFF | PASS, exit 0 | `build/pyrowave-server-off/extension-build.log`, including the `sunshine.exe` link |
+| Windows host, PyroWave ON | PASS, exit 0 | Final BGRX rebuild: `build/pyrowave-server-on/extension-build-bgrx.log`, including the `sunshine.exe` link |
+| Windows host, PyroWave OFF | PASS, exit 0 | Final full rebuild: `build/pyrowave-server-off/extension-build-source-d132eaf7.log`, including the `sunshine.exe` link |
 | Windows conversion shaders | PASS, no warnings | `build/pyrowave-shader-build/compile.log`; three D3DCompileFromFile entrypoints |
 | Linux PyroWave shared library | PASS | 59 Ninja steps; CMake 3.25.1, GCC 12.2.0 in WSL Debian x86-64 |
 | Linux six C++ objects | PASS | KMS capture, CPU device, color conversion, CPU runtime, protocol, negotiation; GCC 12.2 C++23 |
@@ -50,6 +50,9 @@ and `main_uv_ps` 42824 bytes. Compilation executes only the compiler, not captur
 or shader work on the GPU. An FXC warning on branch returns was removed by using
 an initialized return value. The host compiler also identified a COM constness
 error in the cached shader blobs; their storage was corrected before rebuilding.
+Final static review found that DXGI can provide BGRX8 while the new input gate
+accepted BGRA8 only. BGRX8 is now accepted because conversion reads RGB and does
+not depend on alpha. The corrected source compiled and linked successfully.
 
 The Linux runtime is ELF x86-64, SONAME `libpyrowave-shared.so.0`, with all seven
 additive C entrypoints exported and the expected contract present. Its SHA-256
@@ -111,15 +114,20 @@ Build dependencies were extracted locally; no global Linux packages were install
 The three CMake install components `application`, `assets` and `Unspecified`
 completed into `build/pyrowave-portable-extended`. The 209-file directory includes
 the new conversion shader and the extended DLL/contract/license manifest. It was
-not installed as a service or started. The executable rebuilt after commit
-`d132eaf75b078262abfb202c5962c2a37592eb8c` has SHA-256
-`8baaf8d68f7679d470c1512f3ce4af34759c0d33702cc4a0ed1e2c7b835eff5c` and its DLL
+not installed as a service or started. The executable includes the final BGRX
+fix committed in `4dc01db345c9af69869369ae77af20793dd2c54f`, with SHA-256
+`04a30cd73ed6a823730840229151ce937b8587509c75e635c13c3f30afe23bda` and its DLL
 `a3cd076eea4465493374318dae4546c6211648dff439903b6b9275ebce4f1322`.
 The full 209-file manifest is
 `build/pyrowave-server-on/extension-portable-manifest.json`; the successful
-incremental build log is `extension-build-source-d132eaf7.log`. These hashes
+incremental build log is `extension-build-bgrx.log`. These hashes
 identify the artifacts; the local build's embedded version retains its configured
 dirty-build metadata and is not asserted to be a clean Git release identifier.
+
+The same directory is archived locally as
+`build/VibePollo-PyroWave-Windows-x64-4dc01db3.zip` (38,737,345 bytes), SHA-256
+`9f2251412eb5df1acc09c03e88bf4bbf12bd7efe91daab2ab0b21ed6d4597cf4`.
+This is an experimental unsigned build, not an MSI or an installed update.
 
 The existing negotiation tests had only their old limit/version parameters
 updated to the new contract; no test cases were added, compiled or executed.
