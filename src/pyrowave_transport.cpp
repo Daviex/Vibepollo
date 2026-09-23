@@ -28,6 +28,16 @@ namespace pyrowave::transport {
     std::uint16_t processing_latency
   ) {
     const auto limits = protocol::transport_limits(config);
+    if (config.fragmented) {
+      if (!limits || !protocol::plan_fragmented_transport(frame, config)) return std::nullopt;
+      const auto count = frame.size() / limits->payload_bytes;
+      std::vector<std::uint8_t> result(count * (packet_header_bytes + limits->payload_bytes), 0);
+      for (std::size_t i = 0; i < count; ++i) {
+        std::copy_n(frame.begin() + i * limits->payload_bytes, limits->payload_bytes,
+                    result.begin() + i * (packet_header_bytes + limits->payload_bytes) + packet_header_bytes);
+      }
+      return result;
+    }
     if (!limits || !protocol::plan_transport(frame.size(), config) || !protocol::parse_frame(frame)) {
       return std::nullopt;
     }
@@ -64,9 +74,13 @@ namespace pyrowave::transport {
         (data.size() % shard_bytes != 0 && data.size() % shard_bytes <= packet_header_bytes)) {
       return std::nullopt;
     }
-    const auto natural = (planned.data_shards * config.fec_percentage + 99) / 100;
-    const auto parity = config.fec_percentage == 0 ? 0 : std::max(natural, config.min_fec_packets);
-    const auto percentage = parity > natural ? 100 * parity / planned.data_shards : config.fec_percentage;
+    const auto selected_percentage = planned.fec_percentage == 0xffffffffU ? config.fec_percentage : planned.fec_percentage;
+    if (selected_percentage > 255 || (!config.fragmented && selected_percentage != config.fec_percentage) ||
+        (config.fragmented && selected_percentage != config.fec_percentage &&
+         selected_percentage != std::max(config.fec_percentage, config.critical_fec_percentage))) return std::nullopt;
+    const auto natural = (planned.data_shards * selected_percentage + 99) / 100;
+    const auto parity = selected_percentage == 0 ? 0 : std::max(natural, config.min_fec_packets);
+    const auto percentage = parity > natural ? 100 * parity / planned.data_shards : selected_percentage;
     if (parity != planned.parity_shards || percentage > 255 || (planned.data_shards * percentage + 99) / 100 != parity ||
         (cipher && total_shards > std::numeric_limits<std::uint64_t>::max() - iv_counter)) {
       return std::nullopt;

@@ -46,6 +46,7 @@ extern "C" {
 #include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
+#include "pyrowave_negotiation.h"
 #include "pyrowave_protocol.h"
 #include "pyrowave_transport.h"
 #include "rtsp.h"
@@ -754,6 +755,7 @@ namespace stream {
       return 0;
     }
     int updated = 0;
+    int rejected = 0;
     auto lg = ref->control_server._sessions.lock();
     for (auto *session : *ref->control_server._sessions) {
       if (!session || !session->video.bitrate_events) {
@@ -762,6 +764,20 @@ namespace stream {
       if (!client_uuid.empty() && session->device_uuid != client_uuid) {
         continue;
       }
+      if (session->config.monitor.videoFormat == video::codec_wire_value(video::codec_e::pyrowave)) {
+        const auto &monitor = session->config.monitor;
+        const auto fps_x100 = monitor.framerateX100 > 0 ? std::int64_t {monitor.framerateX100} : std::int64_t {monitor.framerate} * 100;
+        if (fps_x100 <= 0 || fps_x100 > std::numeric_limits<int>::max() / 10 ||
+            !pyrowave::negotiation::rate_budget(bitrate_kbps, monitor.pyrowave_negotiated_encoder_bitrate_kbps,
+              monitor.pyrowave_wire_byte_budget, static_cast<std::uint32_t>(fps_x100),
+              static_cast<std::uint32_t>(monitor.width), static_cast<std::uint32_t>(monitor.height),
+              monitor.pyrowave_profile, monitor.pyrowave_transport)) {
+          // The setter's rejection result reaches the control caller. Do
+          // not claim a rate the encode worker will reject or change pacing to it.
+          ++rejected;
+          continue;
+        }
+      }
       // Keep the session metadata (runtime sessions API, history, stats) in sync with the
       // value the encoder thread will adopt from the event below.
       session->config.monitor.bitrate = bitrate_kbps;
@@ -769,7 +785,7 @@ namespace stream {
       session->video.bitrate_events->raise(bitrate_kbps);
       ++updated;
     }
-    return updated;
+    return updated != 0 ? updated : rejected != 0 ? -1 : 0;
   }
 
   static const char *state_name(session::state_e st) {
@@ -1985,12 +2001,21 @@ namespace stream {
           .fec_percentage = static_cast<std::uint32_t>(fecPercentage),
           .min_fec_packets = static_cast<std::uint32_t>(session->config.minRequiredFecPackets),
           .encrypted = static_cast<bool>(session->video.cipher),
+          .fragmented = session->config.monitor.pyrowave_protocol_version == pyrowave::protocol::profile_negotiation_version,
+          .critical_fec_percentage = session->config.monitor.pyrowave_transport.critical_fec_percentage,
         };
-        if (session->config.monitor.pyrowave_protocol_version == pyrowave::protocol::version &&
-            payload.size() <= session->config.monitor.pyrowave_frame_budget) {
-          pyrowave_plan = pyrowave::protocol::plan_transport(payload.size(), transport);
+        const auto frame_budget = packet->pyrowave_frame_budget ? packet->pyrowave_frame_budget : session->config.monitor.pyrowave_frame_budget;
+        const auto wire_budget = packet->pyrowave_wire_byte_budget ? packet->pyrowave_wire_byte_budget : session->config.monitor.pyrowave_wire_byte_budget;
+        if ((session->config.monitor.pyrowave_protocol_version == pyrowave::protocol::version ||
+             session->config.monitor.pyrowave_protocol_version == pyrowave::protocol::profile_negotiation_version) &&
+            frame_budget <= session->config.monitor.pyrowave_frame_budget &&
+            wire_budget <= session->config.monitor.pyrowave_wire_byte_budget && payload.size() <= frame_budget) {
+          pyrowave_plan = transport.fragmented ?
+                            pyrowave::protocol::plan_fragmented_transport(
+                              {reinterpret_cast<const std::uint8_t *>(payload.data()), payload.size()}, transport) :
+                            pyrowave::protocol::plan_transport(payload.size(), transport);
         }
-        if (!pyrowave_plan || pyrowave_plan->wire_bytes > session->config.monitor.pyrowave_wire_byte_budget) {
+        if (!pyrowave_plan || pyrowave_plan->wire_bytes > wire_budget) {
           BOOST_LOG(error) << "PyroWave: dropping frame outside negotiated transport budget";
           continue;
         }

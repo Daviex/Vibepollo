@@ -66,33 +66,85 @@ diff --git a/Granite/vulkan/device.cpp b/Granite/vulkan/device.cpp
 diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
 --- a/pyrowave_c.cpp
 +++ b/pyrowave_c.cpp
-@@ -10,6 +10,12 @@
+@@ -8,7 +8,14 @@
+ #include "pyrowave.h"
+ #include "pyrowave_decoder.hpp"
  #include "pyrowave_encoder.hpp"
++#include "pyrowave_common.hpp"
  #include "logging.hpp"
- 
++
 +#include <memory>
 +#include <new>
 +#ifdef _WIN32
 +#include <windows.h>
 +#endif
-+
+ 
  using namespace Granite;
  using namespace Vulkan;
- using namespace PyroWave;
-@@ -29,6 +35,12 @@
+@@ -29,6 +36,23 @@
  static NullLogger null_logger;
  
  extern "C" {
 +// Local VibePollo extension: checked before creating any GPU resources.
 +const char *pyrowave_vibepollo_runtime_contract(void)
 +{
-+	return "d2997ac172bdc00e29c58e3f2938acb7e94580bf;nt-handle-ownership-v1";
++	return "d2997ac172bdc00e29c58e3f2938acb7e94580bf;nt-handle-ownership-v1;color-metadata-v1;multi-device-v1;allocation-checks-v1;precision-config-v1;cpu-planar-v1;metal-extensions-v1";
++}
++
++// Serialized by the embedding application's process-wide C API lock.
++pyrowave_result pyrowave_vibepollo_configure_precision(int requested, int *effective)
++{
++	if (!effective || requested < -1 || requested > 2)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
++	auto &config = Configuration::get();
++	const bool accepted = config.configure_precision(requested);
++	*effective = config.get_precision();
++	return accepted ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_INVALID_ARGUMENT;
 +}
 +
  void pyrowave_get_api_version(uint32_t *major, uint32_t *minor, uint32_t *patch)
  {
  	*major = PYROWAVE_API_VERSION_MAJOR;
-@@ -439,7 +451,7 @@
+@@ -43,6 +67,38 @@
+ 	VkCommandBuffer cmd = VK_NULL_HANDLE;
+ 	CommandBuffer::Type queue_type = CommandBuffer::Type::Generic;
+ };
++
++// Caller serializes this activation and all subsequent C API operations using
++// the same process-wide lock. Device dispatch tables are per-device in Granite;
++// the instance dispatch table is global in volk and must follow the active GPU.
++pyrowave_result pyrowave_vibepollo_device_activate(pyrowave_device device)
++{
++	if (!device)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
++	const auto instance = device->context.get_instance();
++	if (volkGetLoadedInstance() != instance)
++		volkLoadInstance(instance);
++	return PYROWAVE_SUCCESS;
++}
++
++pyrowave_result pyrowave_vibepollo_device_get_identity(
++        pyrowave_device device, pyrowave_vibepollo_device_identity *identity)
++{
++	if (!device || !identity)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
++	pyrowave_vibepollo_device_activate(device);
++	VkPhysicalDeviceIDProperties id = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
++	VkPhysicalDeviceProperties2 props = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id };
++	vkGetPhysicalDeviceProperties2(device->device.get_physical_device(), &props);
++	static_assert(sizeof(identity->uuid) == sizeof(id.deviceUUID), "UUID size mismatch");
++	static_assert(sizeof(identity->name) == sizeof(props.properties.deviceName), "Device name size mismatch");
++	memcpy(identity->uuid, id.deviceUUID, sizeof(identity->uuid));
++	memcpy(identity->name, props.properties.deviceName, sizeof(identity->name));
++	identity->name[sizeof(identity->name) - 1] = '\0';
++	identity->vendor_id = props.properties.vendorID;
++	identity->device_id = props.properties.deviceID;
++	return PYROWAVE_SUCCESS;
++}
+ 
+ void pyrowave_device_set_command_buffer(pyrowave_device device, VkCommandBuffer cmd)
+ {
+@@ -439,7 +495,7 @@
  {
  	Util::set_thread_logging_interface(&null_logger);
  
@@ -101,7 +153,7 @@ diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
  		return PYROWAVE_ERROR_INVALID_ARGUMENT;
  
  	if ((info->handle_type & (
-@@ -457,6 +469,11 @@
+@@ -457,6 +513,11 @@
  	if (!device.get_device_features().supports_external)
  		return PYROWAVE_ERROR_NOT_IMPLEMENTED;
  
@@ -113,7 +165,7 @@ diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
  	auto sem = device.request_semaphore_external(info->semaphore_type, info->handle_type);
  	if (!sem)
  		return PYROWAVE_ERROR_UNSUPPORTED_EXTERNAL_HANDLE;
-@@ -464,17 +481,24 @@
+@@ -464,17 +525,24 @@
  	ExternalHandle ext = {};
  	ext.handle = (decltype(ext.handle))info->external_handle;
  	ext.semaphore_handle_type = info->handle_type;
@@ -140,7 +192,7 @@ diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
  	return PYROWAVE_SUCCESS;
  }
  
-@@ -557,7 +581,7 @@
+@@ -557,7 +625,7 @@
  pyrowave_result pyrowave_image_create(const pyrowave_image_create_info *info, pyrowave_image *out_image)
  {
  	Util::set_thread_logging_interface(&null_logger);
@@ -149,7 +201,7 @@ diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
  		return PYROWAVE_ERROR_INVALID_ARGUMENT;
  
  	auto &device = info->device->device;
-@@ -581,6 +605,9 @@
+@@ -581,6 +649,9 @@
  	image_create_info.misc = IMAGE_MISC_EXTERNAL_MEMORY_BIT | IMAGE_MISC_NO_DEFAULT_VIEWS_BIT;
  	image_create_info.external.handle = (decltype(image_create_info.external.handle))info->external_handle;
  	image_create_info.external.memory_handle_type = info->handle_type;
@@ -159,7 +211,7 @@ diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
  	image_create_info.pnext = const_cast<void *>(info->image_create_info->pNext);
  	image_create_info.layout = ImageLayout::General;
  	image_create_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-@@ -615,15 +642,25 @@
+@@ -615,15 +686,25 @@
  		}
  	}
  
@@ -187,22 +239,286 @@ diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
  	return PYROWAVE_SUCCESS;
  }
  
+@@ -823,6 +904,7 @@
+ 	Device *device = nullptr;
+ 	pyrowave_device pyro_device = nullptr;
+ 	Encoder encoder;
++	pyrowave_vibepollo_color_info color_info = {};
+ 	Fence queued_fence;
+ 	BufferHandle queued_meta;
+ 	BufferHandle queued_bitstream;
+@@ -834,31 +916,49 @@
+ pyrowave_result
+ pyrowave_encoder_create(const pyrowave_encoder_create_info *info, pyrowave_encoder *encoder)
+ {
+-	Util::set_thread_logging_interface(&null_logger);
+-
+-	if (!info->device)
+-		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+-
+-	if (info->width <= 0 || info->height <= 0)
+-		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+-
+-	if (info->chroma == PYROWAVE_CHROMA_SUBSAMPLING_420 && (info->width % 2 || info->height % 2))
+-		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+-
+-	auto *enc = new pyrowave_encoder_opaque();
+-	enc->pyro_device = info->device;
+-	enc->device = &info->device->device;
+-	enc->chroma = ChromaSubsampling(info->chroma);
+-	enc->width = info->width;
+-	enc->height = info->height;
+-
+-	if (!enc->encoder.init(&info->device->device, info->width, info->height, enc->chroma))
+-	{
+-		delete enc;
+-		return PYROWAVE_ERROR_GENERIC;
+-	}
+-
+-	*encoder = enc;
++	try
++	{
++		Util::set_thread_logging_interface(&null_logger);
++
++		if (!info || !encoder || !info->device)
++			return PYROWAVE_ERROR_INVALID_ARGUMENT;
++
++		if (info->width <= 0 || info->height <= 0 || info->width > 16384 || info->height > 16384)
++			return PYROWAVE_ERROR_INVALID_ARGUMENT;
++
++		if (info->chroma == PYROWAVE_CHROMA_SUBSAMPLING_420 && (info->width % 2 || info->height % 2))
++			return PYROWAVE_ERROR_INVALID_ARGUMENT;
++
++		std::unique_ptr<pyrowave_encoder_opaque> enc(new pyrowave_encoder_opaque());
++		enc->pyro_device = info->device;
++		enc->device = &info->device->device;
++		enc->chroma = ChromaSubsampling(info->chroma);
++		enc->width = info->width;
++		enc->height = info->height;
++
++		if (!enc->encoder.init(&info->device->device, info->width, info->height, enc->chroma))
++		{
++			return PYROWAVE_ERROR_GENERIC;
++		}
++
++		*encoder = enc.release();
++		return PYROWAVE_SUCCESS;
++	}
++	catch (const std::bad_alloc &)
++	{
++		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
++	}
++}
++
++// Local additive extension. Each field follows the pinned sequence-header enums.
++pyrowave_result pyrowave_vibepollo_encoder_set_color_info(
++        pyrowave_encoder encoder, const pyrowave_vibepollo_color_info *info)
++{
++	if (!encoder || !info || info->color_primaries > 1 || info->transfer_function > 1 ||
++	    info->ycbcr_transform > 1 || info->ycbcr_range > 1 || info->chroma_siting > 1)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
++
++	encoder->color_info = *info;
+ 	return PYROWAVE_SUCCESS;
+ }
+ 
+@@ -1160,6 +1260,74 @@
+ 	return ret;
+ }
+ 
++// Planar CPU upload is an alternative input path; encoding still uses Vulkan.
++// It preserves all normalized 16-bit samples and does not down-convert to 8-bit.
++pyrowave_result pyrowave_vibepollo_encoder_encode_cpu_planar_synchronous(
++        pyrowave_encoder encoder, const pyrowave_cpu_buffer *buffers,
++        uint32_t sample_bits, const pyrowave_rate_control *rate_control)
++{
++	Util::set_thread_logging_interface(&null_logger);
++	if (!encoder || !buffers || !rate_control || (sample_bits != 8 && sample_bits != 16) ||
++	    encoder->pyro_device->cmd || buffers->width != encoder->width || buffers->height != encoder->height)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
++	const auto format = encoder->chroma == ChromaSubsampling::Chroma444 ?
++	                    PYROWAVE_CPU_BUFFER_FORMAT_YUV444P : PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
++	if (buffers->format != format)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
++	const uint32_t bytes_per_sample = sample_bits / 8;
++	for (unsigned plane = 0; plane < 3; ++plane)
++	{
++		const size_t divisor = plane && encoder->chroma == ChromaSubsampling::Chroma420 ? 2 : 1;
++		const size_t width = size_t(encoder->width) / divisor;
++		const size_t height = size_t(encoder->height) / divisor;
++		const size_t stride = buffers->row_stride_in_bytes[plane];
++		if (!buffers->data[plane] || !width || !height || stride < width * bytes_per_sample ||
++		    stride % bytes_per_sample || stride / bytes_per_sample > UINT32_MAX ||
++		    buffers->plane_size_in_bytes[plane] / height < stride)
++			return PYROWAVE_ERROR_INVALID_ARGUMENT;
++	}
++	try
++	{
++		auto *device = encoder->device;
++		ImageHandle images[3];
++		pyrowave_gpu_buffers gpu_buffers = {};
++		for (unsigned plane = 0; plane < 3; ++plane)
++		{
++			const unsigned divisor = plane && encoder->chroma == ChromaSubsampling::Chroma420 ? 2 : 1;
++			const ImageInitialData initial = {
++				buffers->data[plane], uint32_t(buffers->row_stride_in_bytes[plane] / bytes_per_sample)
++			};
++			auto info = ImageCreateInfo::immutable_2d_image(
++				encoder->width / divisor, encoder->height / divisor,
++				sample_bits == 16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM);
++			images[plane] = device->create_image(info, &initial);
++			if (!images[plane])
++				return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
++			auto &view = gpu_buffers.planes[plane];
++			view.width = images[plane]->get_width();
++			view.height = images[plane]->get_height();
++			view.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
++			view.swizzle = VK_COMPONENT_SWIZZLE_R;
++			view.image_format = info.format;
++			view.view_format = info.format;
++			view.layout = images[plane]->get_layout(VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL);
++			view.image = images[plane]->get_image();
++		}
++		return pyrowave_encoder_encode_gpu_synchronous(encoder, nullptr, nullptr, &gpu_buffers, rate_control);
++	}
++	catch (const std::bad_alloc &)
++	{
++		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
++	}
++}
++
++pyrowave_result pyrowave_vibepollo_encoder_wait_timeout(pyrowave_encoder encoder, uint64_t nanoseconds)
++{
++	if (!encoder || !encoder->queued_fence)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
++	return encoder->queued_fence->wait_timeout(nanoseconds) ? PYROWAVE_SUCCESS : PYROWAVE_TIMEOUT;
++}
++
+ pyrowave_result
+ pyrowave_encoder_compute_num_packets_with_padding(
+ 		pyrowave_encoder encoder, size_t packet_boundary, size_t padding_size, size_t *num_packets)
+@@ -1223,6 +1391,17 @@
+ 	*out_packets = encoder->encoder.packetize(
+ 		reinterpret_cast<Encoder::Packet *>(packets), packet_boundary, bitstream,
+ 		size, mapped_meta, mapped_bitstream, padding_size);
++
++	// Upstream initializes these VUI fields to zero. Publish the actual input
++	// interpretation without changing dimensions, chroma resolution or payload.
++	BitstreamSequenceHeader header;
++	memcpy(&header, bitstream, sizeof(header));
++	header.color_primaries = encoder->color_info.color_primaries;
++	header.transfer_function = encoder->color_info.transfer_function;
++	header.ycbcr_transform = encoder->color_info.ycbcr_transform;
++	header.ycbcr_range = encoder->color_info.ycbcr_range;
++	header.chroma_siting = encoder->color_info.chroma_siting;
++	memcpy(bitstream, &header, sizeof(header));
+ 
+ 	return PYROWAVE_SUCCESS;
+ }
+@@ -1314,32 +1493,38 @@
+ pyrowave_result
+ pyrowave_decoder_create(const pyrowave_decoder_create_info *info, pyrowave_decoder *decoder)
+ {
+-	Util::set_thread_logging_interface(&null_logger);
+-	if (!info->device)
+-		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+-
+-	if (info->width <= 0 || info->height <= 0)
+-		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+-
+-	if (info->chroma == PYROWAVE_CHROMA_SUBSAMPLING_420 && (info->width % 2 || info->height % 2))
+-		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+-
+-	auto *dec = new pyrowave_decoder_opaque();
+-	dec->pyro_device = info->device;
+-	dec->device = &info->device->device;
+-	dec->chroma = ChromaSubsampling(info->chroma);
+-	dec->fragment_path = info->fragment_path;
+-	dec->width = info->width;
+-	dec->height = info->height;
+-
+-	if (!dec->decoder.init(dec->device, info->width, info->height, dec->chroma, info->fragment_path))
+-	{
+-		delete dec;
+-		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+-	}
+-
+-	*decoder = dec;
+-	return PYROWAVE_SUCCESS;
++	try
++	{
++		Util::set_thread_logging_interface(&null_logger);
++		if (!info || !decoder || !info->device)
++			return PYROWAVE_ERROR_INVALID_ARGUMENT;
++
++		if (info->width <= 0 || info->height <= 0 || info->width > 16384 || info->height > 16384)
++			return PYROWAVE_ERROR_INVALID_ARGUMENT;
++
++		if (info->chroma == PYROWAVE_CHROMA_SUBSAMPLING_420 && (info->width % 2 || info->height % 2))
++			return PYROWAVE_ERROR_INVALID_ARGUMENT;
++
++		std::unique_ptr<pyrowave_decoder_opaque> dec(new pyrowave_decoder_opaque());
++		dec->pyro_device = info->device;
++		dec->device = &info->device->device;
++		dec->chroma = ChromaSubsampling(info->chroma);
++		dec->fragment_path = info->fragment_path;
++		dec->width = info->width;
++		dec->height = info->height;
++
++		if (!dec->decoder.init(dec->device, info->width, info->height, dec->chroma, info->fragment_path))
++		{
++			return PYROWAVE_ERROR_INVALID_ARGUMENT;
++		}
++
++		*decoder = dec.release();
++		return PYROWAVE_SUCCESS;
++	}
++	catch (const std::bad_alloc &)
++	{
++		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
++	}
+ }
+ 
+ void pyrowave_decoder_clear(pyrowave_decoder decoder)
 diff --git a/pyrowave.h b/pyrowave.h
 --- a/pyrowave.h
 +++ b/pyrowave.h
-@@ -71,6 +71,11 @@
- // Used to dynamically detect any API/ABI incompatibility.
+@@ -72,6 +72,34 @@
  // This entry point is stable.
  PYROWAVE_PUBLIC_API void pyrowave_get_api_version(uint32_t *major, uint32_t *minor, uint32_t *patch);
-+
+ 
 +// Local VibePollo extension, not part of the upstream API version.
-+// Returns the pinned bitstream revision and success-only NT ownership contract.
++// Returns the pinned revision, success-only NT ownership and color metadata contracts.
 +// The string is immutable, statically allocated, and valid while this library is loaded.
 +PYROWAVE_PUBLIC_API const char *pyrowave_vibepollo_runtime_contract(void);
- 
++
++// Local VibePollo extension. -1 keeps PYROWAVE_PRECISION/default; 0 FP16,
++// 1 mixed FP16/FP32, 2 FP32. Configuration freezes at the first wavelet instance.
++// Once frozen, a different explicit value returns INVALID_ARGUMENT. The current
++// value is returned in effective. Calls require the process-wide C API lock.
++PYROWAVE_PUBLIC_API pyrowave_result pyrowave_vibepollo_configure_precision(int requested, int *effective);
++
++// Local VibePollo extension for multiple cached Vulkan instances/devices.
++// Activate before a group of C API calls, including destruction, while holding
++// a process-wide lock covering this call and that entire group of operations.
++// Needed because the instance dispatch table is global, unlike device tables.
++PYROWAVE_PUBLIC_API pyrowave_result pyrowave_vibepollo_device_activate(pyrowave_device device);
++
++// Actual selected Vulkan encoder identity, independent of the capture device.
++typedef struct pyrowave_vibepollo_device_identity
++{
++	uint8_t uuid[16];
++	char name[256];
++	uint32_t vendor_id;
++	uint32_t device_id;
++} pyrowave_vibepollo_device_identity;
++PYROWAVE_PUBLIC_API pyrowave_result pyrowave_vibepollo_device_get_identity(
++        pyrowave_device device, pyrowave_vibepollo_device_identity *identity);
++
  // Device API.
  PYROWAVE_PUBLIC_API pyrowave_result pyrowave_create_default_device(pyrowave_device *device);
-@@ -226,7 +231,8 @@
+ 
+@@ -226,7 +254,8 @@
  	// - OPAQUE_WIN32_BIT
  	// - OPAQUE_WIN32_KMT_BIT
  	// - D3D12_FENCE_BIT (D3D11_FENCE_BIT is alias of D3D12_FENCE_BIT)
@@ -212,7 +528,7 @@ diff --git a/pyrowave.h b/pyrowave.h
  	// The semaphore holds a reference to the underlying object.
  	// It may be a good idea to call DuplicateHandle() and hand that over to the implementation instead.
  	// This has been known to workaround some weird bugs in the wild, but the root cause is unknown.
-@@ -299,7 +305,8 @@
+@@ -299,7 +328,8 @@
  	pyrowave_device device;
  
  	// Must be a valid external handle.
@@ -222,14 +538,516 @@ diff --git a/pyrowave.h b/pyrowave.h
  	// The image holds a reference to the underlying object.
  	// It may be a good idea to call DuplicateHandle() and hand that over to the implementation instead.
  	// This has been known to workaround some weird bugs in the wild, but the root cause is unknown.
+@@ -461,10 +491,39 @@
+                                         const pyrowave_gpu_buffers *buffers,
+                                         const pyrowave_rate_control *rate_control);
+ 
++// Local VibePollo extension. Values match the pinned bitstream specification:
++// color_primaries: 0 BT.709, 1 BT.2020; transfer_function: 0 BT.709, 1 PQ;
++// ycbcr_transform: 0 BT.709, 1 BT.2020; ycbcr_range: 0 full, 1 limited;
++// chroma_siting: 0 center, 1 left. Other values are rejected.
++// This describes already converted input; it does not convert pixel values.
++// Set before packetization. Defaults are zero for upstream compatibility.
++typedef struct pyrowave_vibepollo_color_info
++{
++	uint32_t color_primaries;
++	uint32_t transfer_function;
++	uint32_t ycbcr_transform;
++	uint32_t ycbcr_range;
++	uint32_t chroma_siting;
++} pyrowave_vibepollo_color_info;
++
++PYROWAVE_PUBLIC_API pyrowave_result pyrowave_vibepollo_encoder_set_color_info(
++        pyrowave_encoder encoder, const pyrowave_vibepollo_color_info *info);
++
+ // A command buffer must not be set on pyrowave_device.
+ PYROWAVE_PUBLIC_API pyrowave_result
+ pyrowave_encoder_encode_cpu_synchronous(pyrowave_encoder encoder, const pyrowave_cpu_buffer *buffers,
+                                         const pyrowave_rate_control *rate_control);
++
++// Local VibePollo CPU bridge. Only planar YUV420P/YUV444P are accepted.
++// sample_bits is 8 or 16; 16-bit samples cover the complete UNORM16 range and
++// are native little-endian on supported host targets (not P010-shifted 10-bit).
++// GPU submission is synchronous with the caller; wait_timeout must succeed
++// before mapping/packetizing. The application serializes all device operations.
++PYROWAVE_PUBLIC_API pyrowave_result pyrowave_vibepollo_encoder_encode_cpu_planar_synchronous(
++        pyrowave_encoder encoder, const pyrowave_cpu_buffer *buffers,
++        uint32_t sample_bits, const pyrowave_rate_control *rate_control);
++PYROWAVE_PUBLIC_API pyrowave_result pyrowave_vibepollo_encoder_wait_timeout(
++        pyrowave_encoder encoder, uint64_t nanoseconds);
+ 
+ // Can only be called after a successful encoding operation and result is only valid for that particular frame.
+ // Computes the number of network packets required if each packet can consume a provided number of bytes.
 diff --git a/pyrowave-shared.def b/pyrowave-shared.def
 --- a/pyrowave-shared.def
 +++ b/pyrowave-shared.def
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,13 @@
  
  EXPORTS
  	pyrowave_get_api_version
 +	pyrowave_vibepollo_runtime_contract
++	pyrowave_vibepollo_device_get_identity
++	pyrowave_vibepollo_encoder_encode_cpu_planar_synchronous
++	pyrowave_vibepollo_encoder_wait_timeout
++	pyrowave_vibepollo_configure_precision
++	pyrowave_vibepollo_device_activate
++	pyrowave_vibepollo_encoder_set_color_info
  	pyrowave_create_default_device
  	pyrowave_create_device_by_compat
  	pyrowave_create_device
+diff --git a/pyrowave_common.hpp b/pyrowave_common.hpp
+--- a/pyrowave_common.hpp
++++ b/pyrowave_common.hpp
+@@ -149,9 +149,12 @@
+ public:
+ 	static Configuration &get();
+ 	int get_precision() const;
++	bool configure_precision(int requested);
++	void freeze_precision();
+ private:
+ 	Configuration();
+ 	int precision;
++	bool precision_frozen = false;
+ };
+ 
+ struct WaveletBuffers
+@@ -208,10 +211,10 @@
+ 	bool fragment_path = false;
+ 
+ protected:
+-	void init_samplers();
+-	void allocate_images();
+-	void allocate_images_fragment();
+-	virtual void init_block_meta();
++	bool init_samplers();
++	bool allocate_images();
++	bool allocate_images_fragment();
++	virtual bool init_block_meta();
+ 	ChromaSubsampling chroma = {};
+ 
+ 	Shaders<> shaders;
+diff --git a/pyrowave_common.cpp b/pyrowave_common.cpp
+--- a/pyrowave_common.cpp
++++ b/pyrowave_common.cpp
+@@ -38,7 +38,24 @@
+ 	return precision;
+ }
+ 
+-void WaveletBuffers::init_samplers()
++bool Configuration::configure_precision(int requested)
++{
++	if (requested < -1 || requested > 2)
++		return false;
++	if (requested == -1 || requested == precision)
++		return true;
++	if (precision_frozen)
++		return false;
++	precision = requested;
++	return true;
++}
++
++void Configuration::freeze_precision()
++{
++	precision_frozen = true;
++}
++
++bool WaveletBuffers::init_samplers()
+ {
+ 	SamplerCreateInfo samp = {};
+ 	samp.address_mode_u = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+@@ -48,15 +65,21 @@
+ 	samp.mag_filter = VK_FILTER_NEAREST;
+ 	samp.mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+ 	mirror_repeat_sampler = device->create_sampler(samp);
++	if (!mirror_repeat_sampler)
++		return false;
+ 
+ 	samp.address_mode_u = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+ 	samp.address_mode_v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+ 	samp.address_mode_w = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+ 	samp.border_color = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+ 	border_sampler = device->create_sampler(samp);
+-}
+-
+-void WaveletBuffers::allocate_images_fragment()
++	if (!border_sampler)
++		return false;
++
++	return true;
++}
++
++bool WaveletBuffers::allocate_images_fragment()
+ {
+ 	auto format = Configuration::get().get_precision() == 2 ?
+ 	              VK_FORMAT_R32_SFLOAT : VK_FORMAT_R16_SFLOAT;
+@@ -81,6 +104,8 @@
+ 			info.height = horiz_output_height;
+ 			info.format = format;
+ 			fragment.levels[level].horiz[comp] = device->create_image(info);
++			if (!fragment.levels[level].horiz[comp])
++				return false;
+ 			snprintf(label, sizeof(label), "Horiz Output (level %u, comp %u)", level, comp);
+ 			device->set_name(*fragment.levels[level].horiz[comp], label);
+ 
+@@ -90,7 +115,11 @@
+ 				info.height = vert_input_height;
+ 				info.format = comp == 0 ? format : vert_chroma_format;
+ 				fragment.levels[level].vert[0][comp] = device->create_image(info);
++				if (!fragment.levels[level].vert[0][comp])
++					return false;
+ 				fragment.levels[level].vert[1][comp] = device->create_image(info);
++				if (!fragment.levels[level].vert[1][comp])
++					return false;
+ 
+ 				snprintf(label, sizeof(label), "Vert Even Input (level %u, comp %u)", level, comp);
+ 				device->set_name(*fragment.levels[level].vert[0][comp], label);
+@@ -125,12 +154,16 @@
+ 				}
+ 
+ 				fragment.levels[level].decoded[comp][band] = device->create_image_view(view_info);
++				if (!fragment.levels[level].decoded[comp][band])
++					return false;
+ 			}
+ 		}
+ 	}
+-}
+-
+-void WaveletBuffers::allocate_images()
++
++	return true;
++}
++
++bool WaveletBuffers::allocate_images()
+ {
+ 	auto info = ImageCreateInfo::immutable_2d_image(
+ 			aligned_width / 2, aligned_height / 2,
+@@ -143,6 +176,8 @@
+ 	info.levels = Configuration::get().get_precision() != 1 ? DecompositionLevels : WaveletFP16Levels;
+ 
+ 	wavelet_img_high_res = device->create_image(info);
++	if (!wavelet_img_high_res)
++		return false;
+ 	device->set_name(*wavelet_img_high_res, "wavelet-buffer-high-res");
+ 
+ 	if (Configuration::get().get_precision() == 1)
+@@ -153,6 +188,8 @@
+ 		info.width >>= WaveletFP16Levels;
+ 		info.height >>= WaveletFP16Levels;
+ 		wavelet_img_low_res = device->create_image(info);
++		if (!wavelet_img_low_res)
++			return false;
+ 		device->set_name(*wavelet_img_low_res, "wavelet-buffer-low-res");
+ 	}
+ 
+@@ -180,12 +217,18 @@
+ 			view_info.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+ 			view_info.layers = 4;
+ 			component_layer_views[component][level] = device->create_image_view(view_info);
++			if (!component_layer_views[component][level])
++				return false;
+ 
+ 			view_info.view_type = VK_IMAGE_VIEW_TYPE_2D;
+ 			view_info.layers = 1;
+ 			component_ll_views[component][level] = device->create_image_view(view_info);
+-		}
+-	}
++			if (!component_ll_views[component][level])
++				return false;
++		}
++	}
++
++	return true;
+ }
+ 
+ void WaveletBuffers::accumulate_block_mapping(int blocks_x_8x8, int blocks_y_8x8)
+@@ -210,7 +253,7 @@
+ 	block_count_8x8 += blocks_x_8x8 * blocks_y_8x8;
+ }
+ 
+-void WaveletBuffers::init_block_meta()
++bool WaveletBuffers::init_block_meta()
+ {
+ 	for (int level = DecompositionLevels - 1; level >= 0; level--)
+ 	{
+@@ -240,10 +283,23 @@
+ 			}
+ 		}
+ 	}
++
++	return true;
+ }
+ 
+ bool WaveletBuffers::init(Device *device_, int width_, int height_, ChromaSubsampling chroma_, bool fragment_path_)
+ {
++	if (!device_ || width_ <= 0 || height_ <= 0 || width_ > 16384 || height_ > 16384 ||
++	    (chroma_ != ChromaSubsampling::Chroma420 && chroma_ != ChromaSubsampling::Chroma444) ||
++	    (chroma_ == ChromaSubsampling::Chroma420 && ((width_ & 1) || (height_ & 1))))
++		return false;
++	const auto &limits = device_->get_gpu_properties().limits;
++	if (unsigned(width_) > limits.maxImageDimension2D || unsigned(height_) > limits.maxImageDimension2D ||
++	    unsigned(std::max(align(width_, Alignment), MinimumImageSize) / 2) > limits.maxImageDimension2D ||
++	    unsigned(std::max(align(height_, Alignment), MinimumImageSize) / 2) > limits.maxImageDimension2D ||
++	    limits.maxImageArrayLayers < NumFrequencyBandsPerLevel * NumComponents)
++		return false;
++
+ 	device = device_;
+ 	width = width_;
+ 	height = height_;
+@@ -255,12 +311,14 @@
+ 	aligned_width = std::max<int>(aligned_width, MinimumImageSize);
+ 	aligned_height = std::max<int>(aligned_height, MinimumImageSize);
+ 
+-	init_samplers();
+-	allocate_images();
+-	if (fragment_path)
+-		allocate_images_fragment();
+-
+-	init_block_meta();
++	Configuration::get().freeze_precision();
++	if (!init_samplers() || !allocate_images())
++		return false;
++	if (fragment_path && !allocate_images_fragment())
++		return false;
++
++	if (!init_block_meta())
++		return false;
+ 
+ 	Vulkan::ResourceLayout layout;
+ 
+diff --git a/pyrowave_encoder.cpp b/pyrowave_encoder.cpp
+--- a/pyrowave_encoder.cpp
++++ b/pyrowave_encoder.cpp
+@@ -88,7 +88,7 @@
+ 	float get_quant_resolution(int level, int component, int band) const;
+ 	float get_quant_rdo_distortion_scale(int level, int component, int band) const;
+ 
+-	void init_block_meta() override;
++	bool init_block_meta() override;
+ 
+ 	size_t compute_num_packets(const void *meta, size_t packet_boundary, size_t padding_space) const;
+ 	size_t compute_num_critical_packets(int bands, const void *meta, size_t packet_boundary, size_t padding_space) const;
+@@ -175,9 +175,10 @@
+ 	return float(1 << bits);
+ }
+ 
+-void Encoder::Impl::init_block_meta()
+-{
+-	WaveletBuffers::init_block_meta();
++bool Encoder::Impl::init_block_meta()
++{
++	if (!WaveletBuffers::init_block_meta())
++		return false;
+ 
+ 	BufferCreateInfo info;
+ 	info.domain = BufferDomain::Device;
+@@ -185,19 +186,27 @@
+ 
+ 	info.size = block_count_8x8 * sizeof(BlockStats);
+ 	block_stat_buffer = device->create_buffer(info);
++	if (!block_stat_buffer)
++		return false;
+ 	device->set_name(*block_stat_buffer, "block-stat-buffer");
+ 
+ 	info.size = block_count_8x8 * sizeof(BlockMeta);
+ 	meta_buffer = device->create_buffer(info);
++	if (!meta_buffer)
++		return false;
+ 	device->set_name(*meta_buffer, "meta-buffer");
+ 
+ 	// Worst case estimate.
+ 	info.size = aligned_width * aligned_height * 2;
+ 	payload_data = device->create_buffer(info);
++	if (!payload_data)
++		return false;
+ 	device->set_name(*payload_data, "payload-data");
+ 
+ 	info.size = block_count_32x32 * sizeof(uint32_t);
+ 	quant_buffer = device->create_buffer(info);
++	if (!quant_buffer)
++		return false;
+ 	device->set_name(*quant_buffer, "quant-buffer");
+ 
+ 	info.size = RDOBucketOffset;
+@@ -205,7 +214,11 @@
+ 	info.size += NumRDOBuckets * compute_block_count_per_subdivision(block_count_32x32) *
+ 	             BlockSpaceSubdivision * sizeof(RDOperation);
+ 	bucket_buffer = device->create_buffer(info);
++	if (!bucket_buffer)
++		return false;
+ 	device->set_name(*bucket_buffer, "bucket-buffer");
++
++	return true;
+ }
+ 
+ bool Encoder::Impl::block_packing(CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale)
+diff --git a/pyrowave_decoder.cpp b/pyrowave_decoder.cpp
+--- a/pyrowave_decoder.cpp
++++ b/pyrowave_decoder.cpp
+@@ -50,7 +50,7 @@
+ 	bool dequant(CommandBuffer &cmd);
+ 	bool idwt(CommandBuffer &cmd, const ViewBuffers &views);
+ 	bool idwt_fragment(CommandBuffer &cmd, const ViewBuffers &views);
+-	void init_block_meta() override;
++	bool init_block_meta() override;
+ 	void clear();
+ 
+ 	void upload_payload(CommandBuffer &cmd);
+@@ -264,9 +264,10 @@
+ 	return true;
+ }
+ 
+-void Decoder::Impl::init_block_meta()
+-{
+-	WaveletBuffers::init_block_meta();
++bool Decoder::Impl::init_block_meta()
++{
++	if (!WaveletBuffers::init_block_meta())
++		return false;
+ 
+ 	BufferCreateInfo info;
+ 	info.domain = BufferDomain::Device;
+@@ -274,10 +275,14 @@
+ 
+ 	info.size = block_count_32x32 * sizeof(uint32_t);
+ 	dequant_offset_buffer = device->create_buffer(info);
++	if (!dequant_offset_buffer)
++		return false;
+ 	device->set_name(*dequant_offset_buffer, "meta-buffer");
+ 	dequant_offset_buffer_cpu.resize(block_count_32x32);
+ 
+ 	payload_data_cpu.reserve(1024 * 1024);
++
++	return true;
+ }
+ 
+ bool Decoder::Impl::dequant(CommandBuffer &cmd)
+diff --git a/metal/pyrowave_metal.h b/metal/pyrowave_metal.h
+--- a/metal/pyrowave_metal.h
++++ b/metal/pyrowave_metal.h
+@@ -81,6 +81,21 @@
+ // Returns a human readable string for a result code. Never returns NULL.
+ PYROWAVE_PUBLIC_API const char *
+ pyrowave_result_to_string(pyrowave_result result);
++
++// Additive VibePollo contract; the embedding application serializes these calls.
++PYROWAVE_PUBLIC_API const char *pyrowave_vibepollo_runtime_contract(void);
++PYROWAVE_PUBLIC_API pyrowave_result pyrowave_vibepollo_configure_precision(int requested, int *effective);
++
++typedef struct pyrowave_vibepollo_color_info
++{
++    uint32_t color_primaries;   // 0 BT.709, 1 BT.2020.
++    uint32_t transfer_function;// 0 BT.709, 1 PQ.
++    uint32_t ycbcr_transform;  // 0 BT.709, 1 BT.2020 NCL.
++    uint32_t ycbcr_range;      // 0 full, 1 limited.
++    uint32_t chroma_siting;    // 0 center, 1 left.
++} pyrowave_vibepollo_color_info;
++PYROWAVE_PUBLIC_API pyrowave_result pyrowave_vibepollo_encoder_set_color_info(
++        pyrowave_encoder encoder, const pyrowave_vibepollo_color_info *info);
+ 
+ // Device API.
+ 
+diff --git a/metal/pyrowave_common.mm b/metal/pyrowave_common.mm
+--- a/metal/pyrowave_common.mm
++++ b/metal/pyrowave_common.mm
+@@ -15,8 +15,12 @@
+ 
+ namespace PyroWave
+ {
++static int configured_precision = -1;
++static bool precision_locked = false;
++
+ int requested_precision()
+ {
++	if (configured_precision >= 0) return configured_precision;
+ 	const char *env = getenv("PYROWAVE_PRECISION");
+ 	if (!env)
+ 		return DefaultPrecision;
+@@ -226,6 +230,22 @@
+ 	return device_is_supported((__bridge id<MTLDevice>)mtl_device);
+ }
+ 
++const char *pyrowave_vibepollo_runtime_contract(void)
++{
++    return "d2997ac172bdc00e29c58e3f2938acb7e94580bf;nt-handle-ownership-v1;color-metadata-v1;multi-device-v1;allocation-checks-v1;precision-config-v1;cpu-planar-v1;metal-extensions-v1";
++}
++
++pyrowave_result pyrowave_vibepollo_configure_precision(int requested, int *effective)
++{
++    if (!effective || requested < -1 || requested > 2) return PYROWAVE_ERROR_INVALID_ARGUMENT;
++    const int current = requested_precision();
++    *effective = current;
++    if (precision_locked && requested >= 0 && requested != current) return PYROWAVE_ERROR_INVALID_ARGUMENT;
++    if (requested >= 0) configured_precision = requested;
++    *effective = requested_precision();
++    return PYROWAVE_SUCCESS;
++}
++
+ pyrowave_result pyrowave_create_default_device(pyrowave_device *device)
+ {
+ 	pyrowave_device_create_info info = {};
+@@ -253,6 +273,8 @@
+ 		created->message_userdata = info->message_userdata;
+ 		created->mtl = mtl;
+ 		created->precision = requested_precision();
++		configured_precision = created->precision;
++		precision_locked = true;
+ 
+ 		id<MTLLibrary> dequant_library =
+ 				compile_library(created.get(), wavelet_dequant_msl_source, "wavelet_dequant");
+diff --git a/metal/pyrowave_encoder.mm b/metal/pyrowave_encoder.mm
+--- a/metal/pyrowave_encoder.mm
++++ b/metal/pyrowave_encoder.mm
+@@ -236,6 +236,7 @@
+ struct pyrowave_encoder_opaque
+ {
+ 	pyrowave_device device = nullptr;
++	pyrowave_vibepollo_color_info color_info = {};
+ 
+ 	BlockLayout layout;
+ 	WaveletPyramid wavelet;
+@@ -1223,6 +1224,16 @@
+ 	return PYROWAVE_SUCCESS;
+ }
+ 
++pyrowave_result pyrowave_vibepollo_encoder_set_color_info(
++        pyrowave_encoder encoder, const pyrowave_vibepollo_color_info *info)
++{
++    if (!encoder || !info || info->color_primaries > 1 || info->transfer_function > 1 ||
++        info->ycbcr_transform > 1 || info->ycbcr_range > 1 || info->chroma_siting > 1)
++        return PYROWAVE_ERROR_INVALID_ARGUMENT;
++    encoder->color_info = *info;
++    return PYROWAVE_SUCCESS;
++}
++
+ pyrowave_result pyrowave_encoder_packetize_with_padding(pyrowave_encoder encoder, pyrowave_packet *packets,
+                                                         size_t packet_boundary, size_t padding_size,
+                                                         size_t *out_packets,
+@@ -1240,6 +1251,17 @@
+ 	                         bitstream, size,
+ 	                         encoder->bitstream_meta.contents, encoder->bitstream.contents,
+ 	                         padding_size);
++    // packetize emits the 8-byte sequence header first; preserve all layout and
++    // frame fields while describing the pixels supplied by the host converter.
++    if (!*out_packets || size < sizeof(BitstreamSequenceHeader)) return PYROWAVE_ERROR_GENERIC;
++    BitstreamSequenceHeader header;
++    memcpy(&header, bitstream, sizeof(header));
++    header.color_primaries = encoder->color_info.color_primaries;
++    header.transfer_function = encoder->color_info.transfer_function;
++    header.ycbcr_transform = encoder->color_info.ycbcr_transform;
++    header.ycbcr_range = encoder->color_info.ycbcr_range;
++    header.chroma_siting = encoder->color_info.chroma_siting;
++    memcpy(bitstream, &header, sizeof(header));
+ 	return PYROWAVE_SUCCESS;
+ }
+ 
+diff --git a/metal/pyrowave.exports b/metal/pyrowave.exports
+--- a/metal/pyrowave.exports
++++ b/metal/pyrowave.exports
+@@ -24,3 +24,7 @@
+ _pyrowave_encoder_packetize_with_padding
+ _pyrowave_get_api_version
+ _pyrowave_result_to_string
++
++_pyrowave_vibepollo_runtime_contract
++_pyrowave_vibepollo_configure_precision
++_pyrowave_vibepollo_encoder_set_color_info

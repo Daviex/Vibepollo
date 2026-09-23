@@ -1,5 +1,8 @@
 # PyroWave Windows GPU validation
 
+> **PW-X extension status (23 September 2026):** This document records the original SDR 4:2:0 phase at commit `205c510c`. Its limits, hashes and test results are historical. For the extended implementation, use the [capability matrix](pyrowave-capability-matrix.md), [protocol v2](pyrowave-protocol-v2.md) and [extension build report](pyrowave-extension-build.md). The earlier results do not qualify HDR, 4:4:4 or the new transport/runtime paths.
+
+
 Date: 2026-09-23. This records local synthetic GPU checks, actual Windows desktop
 capture/conversion checks, and offline reference decoding of synthetic fixtures.
 It does not establish client presentation or a production streaming session.

@@ -28,6 +28,7 @@ extern "C" {
 #include "misc.h"
 #ifdef SUNSHINE_ENABLE_PYROWAVE
   #include "pyrowave_runtime.h"
+  #include "src/pyrowave_profile.h"
 #endif
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
   #include "game_activity.h"
@@ -89,6 +90,19 @@ namespace platf::dxgi {
 
     return buf_t {buf_p};
   }
+
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+  struct alignas(16) pyrowave_conversion_params_t {
+    std::uint32_t output_pq;
+    std::uint32_t output_primaries_2020;
+    std::uint32_t output_matrix_2020;
+    std::uint32_t output_full_range;
+    std::uint32_t output_444;
+    std::uint32_t output_chroma_left;
+    std::uint32_t input_linear;
+    std::uint32_t input_hdr;
+  };
+#endif
 
   struct alignas(16) sdr_to_pq_params_t {
     float sdr_white_nits;
@@ -516,8 +530,31 @@ namespace platf::dxgi {
       }
 
       auto &img = (img_d3d_t &) img_base;
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+      if (pyrowave_profile && !img.blank && img.format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+          img.format != DXGI_FORMAT_R8G8B8A8_UNORM && img.format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        BOOST_LOG(error) << "PyroWave: capture format is not BGRA8, RGBA8 or linear scRGB FP16";
+        return -1;
+      }
+#endif
       auto draw = [&](auto &input, auto &y_or_yuv_viewports, auto &uv_viewport, DXGI_FORMAT input_format, bool sdr_to_pq, bool truehdr_peak_expand) {
         device_ctx->PSSetShaderResources(0, 1, &input);
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+        if (pyrowave_profile) {
+          auto *params = pyrowave_conversion_params[input_format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 0].get();
+          device_ctx->PSSetConstantBuffers(2, 1, &params);
+          device_ctx->VSSetShader(pyrowave_convert_vs.get(), nullptr, 0);
+          device_ctx->OMSetRenderTargets(1, &out_Y_or_YUV_rtv, nullptr);
+          device_ctx->PSSetShader(pyrowave_y_ps.get(), nullptr, 0);
+          device_ctx->RSSetViewports(1, y_or_yuv_viewports.data());
+          device_ctx->Draw(3, 0);
+          device_ctx->OMSetRenderTargets(1, &out_UV_rtv, nullptr);
+          device_ctx->PSSetShader(pyrowave_uv_ps.get(), nullptr, 0);
+          device_ctx->RSSetViewports(1, &uv_viewport);
+          device_ctx->Draw(3, 0);
+          return;
+        }
+#endif
         ID3D11Buffer *conversion_params_buffer = sdr_to_pq ? sdr_to_pq_params.get() : nullptr;
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
         if (truehdr_peak_expand) {
@@ -1158,6 +1195,83 @@ namespace platf::dxgi {
       rtvs_cleared = target.cleared;
       return 0;
     }
+
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+    bool init_pyrowave_output(ID3D11Texture2D *luma, ID3D11Texture2D *chroma, int width, int height, const ::pyrowave::profile_t &profile) {
+      // Keep optional shader compilation out of legacy encoder startup. Asset
+      // installation already includes this directory; no separate binary is
+      // loaded and the first PyroWave initialization serializes this static.
+      static auto bytecode = []() {
+        std::array<blob_t, 3> shaders;
+        shaders[0] = compile_shader(SUNSHINE_SHADERS_DIR "/pyrowave_convert.hlsl", "main_vs", "vs_5_0");
+        shaders[1] = compile_shader(SUNSHINE_SHADERS_DIR "/pyrowave_convert.hlsl", "main_y_ps", "ps_5_0");
+        shaders[2] = compile_shader(SUNSHINE_SHADERS_DIR "/pyrowave_convert.hlsl", "main_uv_ps", "ps_5_0");
+        return shaders;
+      }();
+      if (!luma || !chroma || !bytecode[0] || !bytecode[1] || !bytecode[2]) {
+        BOOST_LOG(error) << "PyroWave: dedicated conversion shader bytecode is unavailable";
+        return false;
+      }
+      auto status = device->CreateVertexShader(bytecode[0]->GetBufferPointer(), bytecode[0]->GetBufferSize(), nullptr, &pyrowave_convert_vs);
+      if (SUCCEEDED(status)) status = device->CreatePixelShader(bytecode[1]->GetBufferPointer(), bytecode[1]->GetBufferSize(), nullptr, &pyrowave_y_ps);
+      if (SUCCEEDED(status)) status = device->CreatePixelShader(bytecode[2]->GetBufferPointer(), bytecode[2]->GetBufferSize(), nullptr, &pyrowave_uv_ps);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "PyroWave: cannot create conversion shaders: " << util::log_hex(status);
+        return false;
+      }
+
+      const int source_width = display ? display->width : detached_display_width;
+      const int source_height = display ? display->height : detached_display_height;
+      const auto rotation = display ? display->display_rotation : detached_display_rotation;
+      if (source_width <= 0 || source_height <= 0 || width <= 0 || height <= 0) return false;
+      const float scale = std::min(float(width) / source_width, float(height) / source_height);
+      const float content_width = source_width * scale, content_height = source_height * scale;
+      const float offset_x = (width - content_width) / 2, offset_y = (height - content_height) / 2;
+      const float chroma_scale = profile.chroma_444 ? 1.0f : 0.5f;
+      out_Y_or_YUV_viewports.fill(D3D11_VIEWPORT {});
+      out_Y_or_YUV_viewports_for_clear.fill(D3D11_VIEWPORT {});
+      out_Y_or_YUV_viewports[0] = {offset_x, offset_y, content_width, content_height, 0, 1};
+      out_Y_or_YUV_viewports_for_clear[0] = {0, 0, float(width), float(height), 0, 1};
+      out_UV_viewport = {offset_x * chroma_scale, offset_y * chroma_scale, content_width * chroma_scale, content_height * chroma_scale, 0, 1};
+      out_UV_viewport_for_clear = {0, 0, width * chroma_scale, height * chroma_scale, 0, 1};
+
+      const std::int32_t rotation_modifier = rotation == DXGI_MODE_ROTATION_UNSPECIFIED ? 0 : rotation - 1;
+      const std::int32_t rotation_data[4] {-rotation_modifier, 0, 0, 0};
+      pyrowave_rotation = make_buffer(device.get(), rotation_data);
+      if (!pyrowave_rotation) return false;
+      device_ctx->VSSetConstantBuffers(1, 1, &pyrowave_rotation);
+      for (std::uint32_t linear = 0; linear < 2; ++linear) {
+        pyrowave_conversion_params_t parameters {
+          profile.transfer_pq, profile.primaries_bt2020, profile.matrix_bt2020,
+          profile.full_range, profile.chroma_444, profile.chroma_left, linear,
+          display && display->is_hdr(),
+        };
+        pyrowave_conversion_params[linear] = make_buffer(device.get(), parameters);
+        if (!pyrowave_conversion_params[linear]) return false;
+      }
+
+      luma->AddRef();
+      fixed_output_texture.reset(luma);
+      chroma->AddRef();
+      fixed_chroma_texture.reset(chroma);
+      status = device->CreateRenderTargetView(luma, nullptr, &fixed_out_Y_or_YUV_rtv);
+      if (SUCCEEDED(status)) status = device->CreateRenderTargetView(chroma, nullptr, &fixed_out_UV_rtv);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "PyroWave: cannot create plane render targets: " << util::log_hex(status);
+        return false;
+      }
+      output_texture = luma;
+      out_Y_or_YUV_rtv = fixed_out_Y_or_YUV_rtv.get();
+      out_UV_rtv = fixed_out_UV_rtv.get();
+      const float y_black[4] {profile.full_range ? 0.0f : 16.0f / 255.0f, 0, 0, 0};
+      const float uv_black[4] {128.0f / 255.0f, 128.0f / 255.0f, 0, 0};
+      device_ctx->ClearRenderTargetView(out_Y_or_YUV_rtv, y_black);
+      device_ctx->ClearRenderTargetView(out_UV_rtv, uv_black);
+      rtvs_cleared = true;
+      pyrowave_profile = profile;
+      return true;
+    }
+#endif
 
     int init_output(ID3D11Texture2D *frame_texture, int width, int height, const ::video::sunshine_colorspace_t &colorspace, ID3D11Texture2D *chroma_texture = nullptr) {
 
@@ -1929,6 +2043,15 @@ namespace platf::dxgi {
     buf_t sdr_to_pq_params;
     float sdr_to_pq_white_nits = 100.0f;
 
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+    std::optional<::pyrowave::profile_t> pyrowave_profile;
+    std::array<buf_t, 2> pyrowave_conversion_params;
+    buf_t pyrowave_rotation;
+    vs_t pyrowave_convert_vs;
+    ps_t pyrowave_y_ps;
+    ps_t pyrowave_uv_ps;
+#endif
+
     blend_t blend_disable;
     sampler_state_t sampler_linear;
 
@@ -2420,6 +2543,17 @@ namespace platf::dxgi {
 
     std::string error_reason() const override { return failure_reason; }
 
+    frame_metadata_t frame_metadata() const override {
+      frame_metadata_t result;
+      if (!runtime) return result;
+      const auto sample = runtime->last_frame_statistics();
+      for (std::size_t i = 0; i < 5; ++i) result.critical_packets[i] = static_cast<std::uint32_t>(sample.critical_packets[i]);
+      result.active_block_bands = static_cast<std::uint32_t>(sample.active_block_bands);
+      result.active_block_count = static_cast<std::uint32_t>(sample.active_block_count);
+      result.active_block_words = sample.active_block_words;
+      return result;
+    }
+
     bool init_device(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter) {
       if (!adapter || FAILED(adapter->GetDesc(&adapter_desc)) || base.init(std::move(display), adapter, pix_fmt_e::nv12) != 0) {
         failure_reason = "Cannot create the D3D11 device on the capture adapter";
@@ -2439,14 +2573,27 @@ namespace platf::dxgi {
 
     bool init_encoder(const ::video::config_t &config, const ::video::sunshine_colorspace_t &requested_colorspace) override {
       failure_reason.clear();
-      if (runtime || config.width <= 0 || config.height <= 0 || config.width > 8192 || config.height > 8192 ||
-          (config.width & 1) || (config.height & 1) || config.dynamicRange != 0 || config.chromaSamplingType != 0 || config.rtx_hdr_active ||
-          requested_colorspace.colorspace != ::video::colorspace_e::rec709 || !requested_colorspace.full_range || requested_colorspace.bit_depth != 8) {
-        failure_reason = "Unsupported profile; expected even SDR BT.709 full-range 8-bit 4:2:0 dimensions";
-        BOOST_LOG(error) << "PyroWave: unsupported profile; expected even SDR BT.709 full-range 8-bit 4:2:0";
+      const auto &profile = config.pyrowave_profile;
+      if (runtime || config.width <= 0 || config.height <= 0 || config.width > 16384 || config.height > 16384 ||
+          (!profile.chroma_444 && ((config.width & 1) || (config.height & 1)))) {
+        failure_reason = "PyroWave dimensions must be 1..16384; 4:2:0 requires even width and height";
+        BOOST_LOG(error) << "PyroWave: " << failure_reason;
         return false;
       }
-      colorspace = {::video::colorspace_e::rec709, true, 8};
+      if (profile.input_plane_bytes(config.width, config.height) > ::pyrowave::maximum_input_plane_bytes) {
+        failure_reason = "PyroWave input planes exceed the 512 MiB session allocation limit";
+        BOOST_LOG(error) << "PyroWave: " << failure_reason;
+        return false;
+      }
+      int effective_precision = -1;
+      if (!::platf::pyrowave::configure_precision(::config::video.pyrowave_precision, effective_precision, failure_reason)) {
+        BOOST_LOG(error) << "PyroWave: " << failure_reason;
+        return false;
+      }
+      // The complete profile below drives conversion. The generic colorspace
+      // remains available for host diagnostics but cannot express independent
+      // primaries/matrix/transfer or 16-bit normalized input precision.
+      colorspace = requested_colorspace;
       rtx_hdr_active = false;
       hdr_metadata_valid = false;
 
@@ -2454,7 +2601,7 @@ namespace platf::dxgi {
       desc.Width = config.width;
       desc.Height = config.height;
       desc.MipLevels = desc.ArraySize = 1;
-      desc.Format = DXGI_FORMAT_R8_UNORM;
+      desc.Format = profile.high_precision ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
       desc.SampleDesc.Count = 1;
       desc.Usage = D3D11_USAGE_DEFAULT;
       desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -2465,27 +2612,28 @@ namespace platf::dxgi {
         BOOST_LOG(error) << "PyroWave: shared luma texture creation failed: " << util::log_hex(status);
         return false;
       }
-      desc.Width /= 2;
-      desc.Height /= 2;
-      desc.Format = DXGI_FORMAT_R8G8_UNORM;
+      if (!profile.chroma_444) {
+        desc.Width /= 2;
+        desc.Height /= 2;
+      }
+      desc.Format = profile.high_precision ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;
       status = base.device->CreateTexture2D(&desc, nullptr, &chroma_target);
       if (FAILED(status)) {
         failure_reason = "Shared chroma texture creation failed (HRESULT " + std::to_string(static_cast<unsigned long>(status)) + ')';
         BOOST_LOG(error) << "PyroWave: shared chroma texture creation failed: " << util::log_hex(status);
         return false;
       }
-      if (!base.apply_colorspace(colorspace, false) || base.init_output(target.get(), config.width, config.height, colorspace, chroma_target.get()) != 0) {
-        failure_reason = "Cannot initialize the SDR BT.709 conversion shaders and render targets";
+      if (!base.init_pyrowave_output(target.get(), chroma_target.get(), config.width, config.height, profile)) {
+        failure_reason = "Cannot initialize the PyroWave profile conversion shaders and render targets";
         return false;
       }
-      // The established converter emits left-sited chroma. PWVF carries this
-      // explicitly; upstream's default centered color bits are not authoritative.
-      runtime = ::platf::pyrowave::encoder_t::create(base.device.get(), base.device_ctx.get(), target.get(), chroma_target.get(), adapter_desc.AdapterLuid, failure_reason);
+      runtime = ::platf::pyrowave::encoder_t::create(base.device.get(), base.device_ctx.get(), target.get(), chroma_target.get(), adapter_desc.AdapterLuid, profile, failure_reason);
       if (!runtime) {
         BOOST_LOG(error) << "PyroWave: " << failure_reason;
         return false;
       }
-      BOOST_LOG(info) << "PyroWave: created R8/R8G8 Vulkan encoder on capture adapter LUID "
+      BOOST_LOG(info) << "PyroWave: created " << ::pyrowave::profile_name(profile)
+                      << " Vulkan encoder (wavelet precision " << effective_precision << ") on capture adapter LUID "
                       << std::hex << static_cast<std::uint32_t>(adapter_desc.AdapterLuid.HighPart) << ':'
                       << adapter_desc.AdapterLuid.LowPart << std::dec;
       return true;
@@ -2526,6 +2674,7 @@ namespace platf::dxgi {
         statistics.native_bytes += sample.native_bytes;
         statistics.native_packets += sample.native_packets;
         if (++statistics_frames == 300) {
+          for (const auto &line : runtime->performance_statistics()) BOOST_LOG(debug) << "PyroWave GPU: " << line;
           BOOST_LOG(info) << "PyroWave runtime mean over " << statistics_frames << " frames: interop_submit_us="
                           << statistics.interop_submit_us / statistics_frames << " encode_wait_us="
                           << statistics.encode_wait_us / statistics_frames << " packetize_us="

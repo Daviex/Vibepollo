@@ -245,6 +245,8 @@ namespace config {
     std::string fallback_mode;
     bool ignore_encoder_probe_failure;
     bool pyrowave_enabled = false;  ///< Experimental private codec, opt-in after a successful GPU probe.
+    int pyrowave_precision = -1;  ///< -1: upstream default/environment; 0/1/2: wavelet arithmetic/storage precision.
+    std::string pyrowave_device_uuid;  ///< Linux CPU bridge: optional Vulkan encoder GPU UUID.
   };
 
   struct audio_t {

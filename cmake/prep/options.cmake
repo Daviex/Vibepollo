@@ -16,7 +16,7 @@ option(SUNSHINE_CONFIGURE_ONLY "Configure special files only, then exit." OFF)
 
 option(SUNSHINE_ENABLE_TRAY "Enable system tray icon." ON)
 option(SUNSHINE_ENABLE_WEBRTC "Enable WebRTC streaming support (Windows only)." OFF)
-option(SUNSHINE_ENABLE_PYROWAVE "Build experimental PyroWave support (Windows x64 only)." OFF)
+option(SUNSHINE_ENABLE_PYROWAVE "Build experimental PyroWave support (Windows x64, Linux 64-bit, macOS Metal)." OFF)
 
 option(SUNSHINE_SYSTEM_VULKAN_HEADERS "Use system installation of vulkan-headers rather than the submodule." OFF)
 option(SUNSHINE_SYSTEM_WAYLAND_PROTOCOLS "Use system installation of wayland-protocols rather than the submodule." OFF)

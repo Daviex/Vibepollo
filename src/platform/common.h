@@ -29,6 +29,8 @@
 #include "src/thread_safe.h"
 #include "src/utility.h"
 #include "src/video_colorspace.h"
+#include "src/pyrowave_colors.h"
+#include "src/platform/pyrowave_cpu_device.h"
 
 extern "C" {
 #include <moonlight-common-c/src/Limelight.h>
@@ -227,7 +229,8 @@ namespace platf {
     dxgi,  ///< DXGI
     cuda,  ///< CUDA
     videotoolbox,  ///< VideoToolbox
-    unknown  ///< Unknown
+    unknown,  ///< Unknown
+    vulkan  ///< Vulkan; appended to preserve existing memory-type values
   };
 
   enum class pix_fmt_e {
@@ -372,6 +375,8 @@ namespace platf {
     std::int32_t height {};
     std::int32_t pixel_pitch {};
     std::int32_t row_pitch {};
+    // System-memory PyroWave capture preserves the source transfer and storage.
+    ::pyrowave::colors::input_format_e pyrowave_pixel_format = ::pyrowave::colors::input_format_e::bgra8_srgb;
 
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
@@ -477,8 +482,16 @@ namespace platf {
   };
 
   struct pyrowave_encode_device_t: encode_device_t {
+    struct frame_metadata_t {
+      std::array<std::uint32_t, 5> critical_packets {};
+      std::uint32_t active_block_bands = 3;
+      std::uint32_t active_block_count = 0;
+      std::vector<std::uint32_t> active_block_words;
+    };
     virtual bool init_encoder(const video::config_t &client_config, const video::sunshine_colorspace_t &colorspace) = 0;
     virtual std::string error_reason() const { return {}; }
+    virtual std::string adapter_identity() const { return {}; }
+    virtual frame_metadata_t frame_metadata() const { return {}; }
 
     // One complete frame as native upstream packets, before transport framing.
     // Calls are serialized on the session's encode worker.
@@ -585,7 +598,11 @@ namespace platf {
     }
 
     virtual std::unique_ptr<pyrowave_encode_device_t> make_pyrowave_encode_device() {
+#if defined(SUNSHINE_ENABLE_PYROWAVE) && (defined(__linux__) || defined(__APPLE__))
+      return make_pyrowave_cpu_encode_device(is_hdr());
+#else
       return nullptr;
+#endif
     }
 
     virtual std::unique_ptr<amf_encode_device_t> make_amf_encode_device(pix_fmt_e pix_fmt) {

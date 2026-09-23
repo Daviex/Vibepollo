@@ -46,6 +46,7 @@ extern "C" {
 #include "platform/common.h"
 #include "process.h"
 #include "pyrowave_protocol.h"
+#include "pyrowave_negotiation.h"
 #include "sync.h"
 #include "video.h"
 #include "video_policy.h"
@@ -5751,13 +5752,25 @@ namespace video {
   }
 
   namespace {
-    struct pyrowave_probe_state_t {
-      std::mutex mutex;
-      std::atomic<bool> session_active {false};
-      std::optional<encoder_probe_policy::cache_key_t> key;
+    struct pyrowave_probe_entry_t {
       std::optional<platf::adapter_id_t> adapter;
       pyrowave_probe_result_t result;
       std::chrono::steady_clock::time_point expires {};
+    };
+
+    struct pyrowave_probe_state_t {
+      std::mutex mutex;
+      std::atomic<unsigned> active_sessions {0};
+      // Shared capture/encoder configuration; profile identity belongs to the
+      // bounded entry index so a UI probe cannot replace another admission.
+      std::optional<encoder_probe_policy::cache_key_t> key;
+      std::array<pyrowave_probe_entry_t, 128> profiles;
+
+      void clear(std::string reason = {}) {
+        key.reset();
+        profiles = {};
+        for (auto &entry : profiles) entry.result.reason = reason;
+      }
     };
 
     pyrowave_probe_state_t &pyrowave_probe_state() {
@@ -5765,55 +5778,97 @@ namespace video {
       return state;
     }
 
+#if defined(SUNSHINE_ENABLE_PYROWAVE)
+    std::size_t pyrowave_probe_profile_index(const pyrowave::profile_t &profile) {
+      return std::size_t(profile.chroma_444) | (std::size_t(profile.high_precision) << 1) |
+             (std::size_t(profile.full_range) << 2) | (std::size_t(profile.chroma_left) << 3) |
+             (std::size_t(profile.primaries_bt2020) << 4) | (std::size_t(profile.matrix_bt2020) << 5) |
+             (std::size_t(profile.transfer_pq) << 6);
+    }
+
+    probe_target_t resolve_pyrowave_probe_target() {
+      auto target = resolve_probe_target();
+#ifndef _WIN32
+      target.display_name = config::get_active_output_name();
+#endif
+      return target;
+    }
+
+    encoder_probe_policy::cache_key_t pyrowave_probe_configuration_key(const probe_target_t &target) {
+      return {
+        .encoder_configuration = "pyrowave|" + std::string(pyrowave::protocol::bitstream_revision) +
+                                 "|capture=" + config::video.capture + "|output=" + target.display_name +
+                                 "|precision=" + std::to_string(config::video.pyrowave_precision) +
+                                 "|encoder-uuid=" + config::video.pyrowave_device_uuid,
+        .adapter_identity = target.adapter_identity.identity,
+        .adapter_identity_resolved = target.adapter_identity.resolved,
+        .kind = encoder_probe_policy::probe_kind_e::pyrowave,
+      };
+    }
+#endif
+
     struct pyrowave_session_lease_t {
-      platf::adapter_id_t adapter;
+      std::optional<platf::adapter_id_t> adapter;
       std::string adapter_identity;
+      pyrowave::profile_t profile;
     };
 
     [[maybe_unused]] void invalidate_pyrowave_probe(std::string reason) {
       auto &state = pyrowave_probe_state();
       std::lock_guard lock(state.mutex);
-      state.result.available = false;
-      state.result.reason = std::move(reason);
-      state.expires = {};
+      state.clear(std::move(reason));
     }
   }  // namespace
 
-  pyrowave_probe_result_t probe_pyrowave(bool force) {
+  std::vector<std::string> pyrowave_profiles() {
+    std::vector<std::string> result;
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+    for (const auto &name : pyrowave::profiles()) {
+#ifdef __APPLE__
+      // The pinned Metal encoder accepts only R8 input surfaces/CPU planes.
+      if (pyrowave::parse_profile(name)->high_precision) continue;
+#endif
+      result.push_back(name);
+    }
+#endif
+    return result;
+  }
+
+  pyrowave_probe_result_t probe_pyrowave(bool force, pyrowave::profile_t profile) {
     auto &state = pyrowave_probe_state();
     std::lock_guard lock(state.mutex);
     if (!config::video.pyrowave_enabled) {
-      state.key.reset();
-      state.adapter.reset();
-      state.result = {.reason = "PyroWave is disabled on the host"};
-      return state.result;
+      state.clear("PyroWave is disabled on the host");
+      return {.reason = "PyroWave is disabled on the host"};
     }
-#if defined(_WIN32) && defined(SUNSHINE_ENABLE_PYROWAVE)
-    const auto target = resolve_probe_target();
-    const encoder_probe_policy::cache_key_t key {
-      .encoder_configuration = "pyrowave|" + std::string(pyrowave::protocol::bitstream_revision) +
-                               "|capture=" + config::video.capture + "|output=" + target.display_name,
-      .adapter_identity = target.adapter_identity.identity,
-      .adapter_identity_resolved = target.adapter_identity.resolved,
-      .kind = encoder_probe_policy::probe_kind_e::pyrowave,
-    };
+#if defined(SUNSHINE_ENABLE_PYROWAVE)
+    const auto target = resolve_pyrowave_probe_target();
+#ifdef _WIN32
+    constexpr auto capture_memory = platf::mem_type_e::dxgi;
+#else
+    constexpr auto capture_memory = platf::mem_type_e::system;
+#endif
+    const auto key = pyrowave_probe_configuration_key(target);
+    if (!encoder_probe_policy::cache_key_matches(key, state.key)) {
+      state.clear();
+      state.key = key;
+    }
+    auto &entry = state.profiles[pyrowave_probe_profile_index(profile)];
     const auto now = std::chrono::steady_clock::now();
-    if (!force && encoder_probe_policy::cache_key_matches(key, state.key) && now < state.expires) {
-      return state.result;
-    }
-    if (state.session_active.load(std::memory_order_acquire)) {
-      return {.reason = "PyroWave adapter probe cannot run during an active PyroWave session"};
+    if (!force && now < entry.expires) {
+      return entry.result;
     }
     auto publish = [&](pyrowave_probe_result_t result, std::optional<platf::adapter_id_t> adapter = std::nullopt) {
-      state.key = key;
-      state.adapter = adapter;
-      state.result = std::move(result);
-      state.expires = std::chrono::steady_clock::now() + (state.result.available ? 30s : 5s);
-      return state.result;
+      entry.adapter = adapter;
+      entry.result = std::move(result);
+      entry.expires = std::chrono::steady_clock::now() + (entry.result.available ? 30s : 5s);
+      return entry.result;
     };
+#ifdef _WIN32
     if (!target.adapter_identity.resolved || !target.required_adapter) {
       return publish({.reason = "PyroWave capture adapter could not be resolved"});
     }
+#endif
     config_t probe_config {};
     probe_config.width = probe_config.height = 64;
     probe_config.framerate = 60;
@@ -5821,21 +5876,25 @@ namespace video {
     probe_config.encodingFramerate = 60000;
     probe_config.bitrate = 200000;
     probe_config.videoFormat = codec_wire_value(codec_e::pyrowave);
-    probe_config.encoderCscMode = 3;
-    probe_config.force_sdr = true;
+    probe_config.encoderCscMode = profile.encoder_csc_mode();
+    probe_config.force_sdr = !profile.transfer_pq;
+    probe_config.dynamicRange = profile.transfer_pq;
+    probe_config.chromaSamplingType = profile.chroma_444;
+    probe_config.pyrowave_profile = profile;
     try {
-      auto display = platf::display(platf::mem_type_e::dxgi, target.display_name, probe_config, target.required_adapter);
+      auto display = platf::display(capture_memory, target.display_name, probe_config, target.required_adapter);
       if (!display) {
         return publish({.reason = "PyroWave could not initialize capture on the selected adapter"});
       }
-      if (display->is_hdr()) {
-        return publish({.reason = "PyroWave v1 requires an SDR capture display; HDR tone mapping is not qualified"});
-      }
       const auto observed_adapter = display->capture_adapter_id();
+#ifdef _WIN32
       if (!observed_adapter || *observed_adapter != *target.required_adapter) {
         return publish({.reason = "PyroWave capture adapter did not match the requested LUID"});
       }
       const auto identity = adapter_cache_identity(*observed_adapter);
+#else
+      std::string identity;
+#endif
       auto image = display->alloc_img();
       auto device = display->make_pyrowave_encode_device();
       auto teardown = util::fail_guard([&]() {
@@ -5844,11 +5903,18 @@ namespace video {
         image.reset();
         display.reset();
       });
-      if (!device || !device->init_encoder(probe_config, {colorspace_e::rec709, true, 8})) {
+      const sunshine_colorspace_t colorspace {profile.transfer_pq ? colorspace_e::bt2020 :
+        (profile.primaries_bt2020 ? colorspace_e::bt2020sdr : colorspace_e::rec709),
+        profile.full_range, profile.high_precision ? 16u : 8u};
+      if (!device || !device->init_encoder(probe_config, colorspace)) {
         const auto detail = device ? device->error_reason() : std::string {};
         return publish({.adapter_identity = identity, .reason = detail.empty() ?
           "PyroWave Vulkan API, GPU features or D3D11 interop initialization failed; see host log" : detail});
       }
+#ifndef _WIN32
+      identity = device->adapter_identity();
+      if (identity.empty()) return publish({.reason = "PyroWave encoder GPU identity is unavailable"});
+#endif
       if (!image || display->dummy_img(image.get()) != 0 || device->convert(*image) != 0) {
         const auto detail = device->error_reason();
         return publish({.adapter_identity = identity, .reason = detail.empty() ? "PyroWave probe could not convert its test image" : detail});
@@ -5864,59 +5930,89 @@ namespace video {
       if (!pyrowave::protocol::serialize_frame(0, 0, packets, pyrowave::protocol::max_frame_size)) {
         return publish({.adapter_identity = identity, .reason = "PyroWave probe returned an invalid native packet sequence"});
       }
-      BOOST_LOG(info) << "PyroWave: independent GPU probe succeeded on " << identity;
+      BOOST_LOG(info) << "PyroWave: independent GPU probe succeeded on " << identity
+                      << " profile=" << pyrowave::profile_name(profile);
       return publish({.available = true, .adapter_identity = identity}, observed_adapter);
     } catch (const std::exception &error) {
       return publish({.reason = "PyroWave probe failed: " + std::string(error.what())});
     }
 #else
-    return {.reason = "PyroWave is not included in this build; Windows x64 support is required"};
+    return {.reason = "PyroWave is not included in this build"};
 #endif
   }
 
-  std::shared_ptr<void> acquire_pyrowave_session() {
+  std::shared_ptr<void> acquire_pyrowave_session(pyrowave::profile_t profile) {
     auto &state = pyrowave_probe_state();
     // The same mutex serializes admission with an in-progress GPU probe.
     std::lock_guard lock(state.mutex);
-    if (!config::video.pyrowave_enabled || !state.result.available || !state.adapter ||
-        std::chrono::steady_clock::now() >= state.expires ||
-        state.session_active.load(std::memory_order_acquire)) {
+    if (!config::video.pyrowave_enabled) {
+      state.clear("PyroWave is disabled on the host");
       return {};
     }
+#if defined(SUNSHINE_ENABLE_PYROWAVE)
+    // Recheck configuration at admission too: a successful probe must not grant
+    // a lease after capture output, encoder selection or precision has changed.
+    const auto key = pyrowave_probe_configuration_key(resolve_pyrowave_probe_target());
+    if (!encoder_probe_policy::cache_key_matches(key, state.key)) {
+      state.clear();
+      return {};
+    }
+    const auto &entry = state.profiles[pyrowave_probe_profile_index(profile)];
+    if (!entry.result.available || std::chrono::steady_clock::now() >= entry.expires) {
+      return {};
+    }
+    auto value = std::make_unique<pyrowave_session_lease_t>(
+      pyrowave_session_lease_t {entry.adapter, entry.result.adapter_identity, profile});
+    // Increment only after allocating the lease. If shared_ptr's control-block
+    // allocation fails, its deleter balances the already incremented counter.
+    state.active_sessions.fetch_add(1, std::memory_order_acq_rel);
     auto lease = std::shared_ptr<pyrowave_session_lease_t>(
-      new pyrowave_session_lease_t {*state.adapter, state.result.adapter_identity},
+      value.release(),
       [](pyrowave_session_lease_t *value) {
         delete value;
-        pyrowave_probe_state().session_active.store(false, std::memory_order_release);
+        pyrowave_probe_state().active_sessions.fetch_sub(1, std::memory_order_acq_rel);
       });
-    state.session_active.store(true, std::memory_order_release);
     return lease;
+#else
+    return {};
+#endif
   }
 
-#if defined(_WIN32) && defined(SUNSHINE_ENABLE_PYROWAVE)
+#if defined(SUNSHINE_ENABLE_PYROWAVE)
   void capture_pyrowave(safe::mail_t mail, config_t config, void *channel_data) {
+#ifdef _WIN32
+    constexpr auto capture_memory = platf::mem_type_e::dxgi;
+#else
+    constexpr auto capture_memory = platf::mem_type_e::system;
+#endif
     auto shutdown = mail->event<bool>(mail::shutdown);
     auto stop_session = util::fail_guard([&]() { shutdown->raise(true); });
     if (!config::video.pyrowave_enabled || !config.pyrowave_session_lease ||
-        config.pyrowave_protocol_version != pyrowave::protocol::version ||
+        (config.pyrowave_protocol_version != pyrowave::protocol::version &&
+         config.pyrowave_protocol_version != pyrowave::protocol::profile_negotiation_version) ||
         config.pyrowave_frame_budget <= pyrowave::protocol::frame_header_size || config.pyrowave_encoder_target_bytes <= 8) {
       BOOST_LOG(error) << "PyroWave: missing negotiated session, byte budget or admission lease";
       return;
     }
     const auto lease = std::static_pointer_cast<pyrowave_session_lease_t>(config.pyrowave_session_lease);
+    if (lease->profile != config.pyrowave_profile) {
+      BOOST_LOG(error) << "PyroWave: negotiated profile does not match the admission probe";
+      return;
+    }
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto bitrate_events = mail->event<int>(mail::dynamic_bitrate);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
     auto switch_events = mail::man->event<int>(mail::switch_display);
     auto touch_events = mail->event<input::touch_port_t>(mail::touch_port);
-    mail->event<hdr_info_t>(mail::hdr)->raise(std::make_unique<hdr_info_raw_t>(false));
-    if (config.framerate < 1 || config.framerate > 240 || config.framerateX100 < 0) {
+    auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
+    std::optional<hdr_info_raw_t> last_hdr_info;
+    if (config.framerate < 1 || config.framerateX100 < 0) {
       BOOST_LOG(error) << "PyroWave: invalid session framerate";
       return;
     }
-    const auto fps_x100 = config.framerateX100 > 0 ? config.framerateX100 : config.framerate * 100;
-    if (fps_x100 < 100 || fps_x100 > 24000) {
+    const auto fps_x100 = config.framerateX100 > 0 ? std::int64_t {config.framerateX100} : std::int64_t {config.framerate} * 100;
+    if (fps_x100 < 1 || fps_x100 > std::numeric_limits<int>::max() / 10) {
       BOOST_LOG(error) << "PyroWave: invalid session framerate";
       return;
     }
@@ -5925,7 +6021,12 @@ namespace video {
     const auto session_start = std::chrono::steady_clock::now();
     const auto frame_interval = std::chrono::nanoseconds {100'000'000'000LL / fps_x100};
     policy::pyrowave_pacer_t pacer(frame_interval);
-    const auto native_target = config.pyrowave_encoder_target_bytes;
+    auto native_target = config.pyrowave_encoder_target_bytes;
+    const auto negotiated_encoder_kbps = config.pyrowave_negotiated_encoder_bitrate_kbps;
+    const auto negotiated_wire_bytes = config.pyrowave_wire_byte_budget;
+    const sunshine_colorspace_t colorspace {config.pyrowave_profile.transfer_pq ? colorspace_e::bt2020 :
+      (config.pyrowave_profile.primaries_bt2020 ? colorspace_e::bt2020sdr : colorspace_e::rec709),
+      config.pyrowave_profile.full_range, config.pyrowave_profile.high_precision ? 16u : 8u};
     std::uint64_t frame_index = 1;
     std::uint64_t last_presentation_us = 0;
     std::uint64_t encoded_frames = 0, backpressure_skips = 0, payload_bytes = 0;
@@ -5946,7 +6047,7 @@ namespace video {
     std::string preferred_display;
     auto startup_deadline = std::chrono::steady_clock::now() + 10s;
     while (!shutdown->peek() && packets->running()) {
-      refresh_displays(platf::mem_type_e::dxgi, display_names, display_index, preferred_display);
+      refresh_displays(capture_memory, display_names, display_index, preferred_display);
       if (!ensure_virtual_display_ready(display_names, display_index) || display_names.empty()) {
         if (std::chrono::steady_clock::now() >= startup_deadline) {
           BOOST_LOG(error) << "PyroWave: display did not become ready within the startup deadline";
@@ -5960,7 +6061,7 @@ namespace video {
         if (requested >= 0) display_index = std::clamp(requested, 0, static_cast<int>(display_names.size()) - 1);
       }
       display_index = std::clamp(display_index, 0, static_cast<int>(display_names.size()) - 1);
-      auto display = platf::display(platf::mem_type_e::dxgi, display_names[display_index], config, lease->adapter);
+      auto display = platf::display(capture_memory, display_names[display_index], config, lease->adapter);
       if (!display) {
         if (std::chrono::steady_clock::now() >= startup_deadline) {
           invalidate_pyrowave_probe("PyroWave capture display initialization failed");
@@ -5971,16 +6072,19 @@ namespace video {
         continue;
       }
       const auto actual_adapter = display->capture_adapter_id();
-      if (!actual_adapter || *actual_adapter != lease->adapter) {
+      if (lease->adapter && (!actual_adapter || *actual_adapter != *lease->adapter)) {
         invalidate_pyrowave_probe("PyroWave session adapter changed; renegotiation required");
         BOOST_LOG(error) << "PyroWave: refusing capture on an adapter that did not pass this session's probe";
         return;
       }
-      if (display->is_hdr()) {
-        invalidate_pyrowave_probe("PyroWave v1 requires an SDR capture display");
-        BOOST_LOG(error) << "PyroWave: HDR capture requires a separately qualified tone-mapping path";
-        return;
+      SS_HDR_METADATA hdr_metadata {};
+      if (config.pyrowave_profile.transfer_pq && display->is_hdr()) {
+        display->get_hdr_metadata(hdr_metadata);
       }
+      // Unknown mastering metadata stays zero. PQ is a property of the
+      // negotiated transfer function, including when the source is SDR.
+      raise_hdr_info_if_changed(hdr_event, last_hdr_info,
+        std::make_unique<hdr_info_raw_t>(config.pyrowave_profile.transfer_pq, hdr_metadata));
       auto image = display->alloc_img();
       std::shared_ptr<platf::img_t> last_image;
       std::optional<std::chrono::steady_clock::time_point> last_capture_timestamp;
@@ -5994,16 +6098,21 @@ namespace video {
         image.reset();
         display.reset();
       });
-      if (!image || !device || !device->init_encoder(config, {colorspace_e::rec709, true, 8})) {
+      if (!image || !device || !device->init_encoder(config, colorspace)) {
         invalidate_pyrowave_probe("PyroWave capture encoder initialization failed");
         BOOST_LOG(error) << "PyroWave: capture encoder initialization failed";
         return;
       }
+#ifndef _WIN32
+      if (device->adapter_identity() != lease->adapter_identity) {
+        invalidate_pyrowave_probe("PyroWave encoder GPU changed after its admission probe");
+        return;
+      }
+#endif
       touch_events->raise(make_port(display.get(), config));
       BOOST_LOG(info) << "PyroWave: capturing on " << lease->adapter_identity << " at " << config.width << 'x' << config.height;
       bool requested_reinit = false;
       bool encode_failed = false;
-      bool policy_stop = false;
       auto push_image = [&](std::shared_ptr<platf::img_t> &&captured, bool frame_captured) {
         if (shutdown->peek() || !packets->running() || !config::video.pyrowave_enabled) return false;
         if (switch_events->peek()) {
@@ -6013,11 +6122,20 @@ namespace video {
         if (bitrate_events->peek()) {
           const int requested = *bitrate_events->pop();
           if (requested != config.bitrate) {
-            // The encoder and wire budgets are negotiated together. This first
-            // contract cannot update one without revalidating MTU/FEC overhead.
-            BOOST_LOG(error) << "PyroWave v1: bitrate changes require session renegotiation";
-            policy_stop = true;
-            return false;
+            // Apply the same admission calculation as the control setter.
+            // Queued frames retain the budgets used to encode their own bytes.
+            const auto budget = pyrowave::negotiation::rate_budget(requested, negotiated_encoder_kbps,
+              negotiated_wire_bytes, static_cast<std::uint32_t>(fps_x100), config.width, config.height,
+              config.pyrowave_profile, config.pyrowave_transport);
+            if (!budget) {
+              BOOST_LOG(warning) << "PyroWave: bitrate request is outside the admitted encoder range or cannot carry its envelope: " << requested << " Kbps";
+            } else {
+              native_target = budget->encoder_target_bytes;
+              config.bitrate = requested;
+              config.pyrowave_frame_budget = budget->frame_budget;
+              config.pyrowave_wire_byte_budget = budget->wire_byte_budget;
+              BOOST_LOG(info) << "PyroWave: encoder bitrate updated to " << requested << " Kbps, target=" << native_target << " bytes/frame";
+            }
           }
         }
         const bool request_idr = idr_events->peek();
@@ -6054,8 +6172,12 @@ namespace video {
         const auto presentation_time = frame_captured ? capture_time : now;
         const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(presentation_time - session_start).count();
         const auto presentation_us = std::max(last_presentation_us + 1, static_cast<std::uint64_t>(std::max<int64_t>(0, elapsed)));
-        auto framed = pyrowave::protocol::serialize_frame(frame_index, presentation_us,
-                                                        native_packets, config.pyrowave_frame_budget);
+        const auto metadata = device->frame_metadata();
+        auto framed = config.pyrowave_transport.fragmented ?
+          pyrowave::protocol::serialize_fragmented_frame(frame_index, presentation_us, native_packets,
+            {metadata.critical_packets, metadata.active_block_bands, metadata.active_block_count, metadata.active_block_words},
+            config.pyrowave_transport, config.pyrowave_frame_budget) :
+          pyrowave::protocol::serialize_frame(frame_index, presentation_us, native_packets, config.pyrowave_frame_budget);
         if (!framed) {
           encode_failed = true;
           return false;
@@ -6068,6 +6190,8 @@ namespace video {
         if (encoded_frames % 300 == 0) report_statistics();
         auto packet = std::make_unique<packet_raw_generic>(std::move(*framed), static_cast<int64_t>(frame_index++), true);
         packet->channel_data = channel_data;
+        packet->pyrowave_wire_byte_budget = config.pyrowave_wire_byte_budget;
+        packet->pyrowave_frame_budget = config.pyrowave_frame_budget;
         packet->frame_timestamp = frame_captured ? last_pacing_timestamp.value_or(presentation_time) : presentation_time;
         packet->capture_timestamp = last_capture_timestamp;
         packet->host_processing_timestamp = frame_captured ? last_host_processing_timestamp.value_or(now) : now;
@@ -6086,7 +6210,6 @@ namespace video {
         return true;
       };
       const auto status = display->capture(push_image, pull_image, &display_cursor);
-      if (policy_stop) return;
       if (encode_failed || status == platf::capture_e::error) {
         invalidate_pyrowave_probe("PyroWave capture or encoding failed; check GPU diagnostics");
         BOOST_LOG(error) << "PyroWave: capture or encoding failed";
@@ -6107,7 +6230,7 @@ namespace video {
     config_t config,
     void *channel_data
   ) {
-#if defined(_WIN32) && defined(SUNSHINE_ENABLE_PYROWAVE)
+#if defined(SUNSHINE_ENABLE_PYROWAVE)
     if (config.videoFormat == codec_wire_value(codec_e::pyrowave)) {
       try {
         capture_pyrowave(std::move(mail), std::move(config), channel_data);

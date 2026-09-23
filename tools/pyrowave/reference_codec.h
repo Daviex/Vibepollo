@@ -1,6 +1,7 @@
 #pragma once
 // Shared native reference codec helpers for standalone validation harnesses.
 #include "src/platform/windows/pyrowave_runtime.h"
+#include "src/pyrowave_runtime_contract.h"
 
 #include <algorithm>
 #include <array>
@@ -99,7 +100,7 @@ namespace pyrowave_smoke {
       using contract_fn = const char *(*)();
       const auto contract = std::bit_cast<contract_fn>(GetProcAddress(module, "pyrowave_vibepollo_runtime_contract"));
       const char *value = contract ? contract() : nullptr;
-      if (!value || std::strcmp(value, "d2997ac172bdc00e29c58e3f2938acb7e94580bf;nt-handle-ownership-v1") != 0) throw std::runtime_error("Reference decoder requires the bundled pinned runtime contract");
+      if (!value || ::pyrowave::runtime_contract != value) throw std::runtime_error("Reference decoder requires the bundled pinned runtime contract");
       PYROWAVE_LOAD(pyrowave_create_device_by_compat);
       PYROWAVE_LOAD(pyrowave_device_destroy);
       PYROWAVE_LOAD(pyrowave_decoder_create);

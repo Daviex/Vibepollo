@@ -1,0 +1,165 @@
+---
+name: PyroWave macOS build
+
+# Opt-in compilation only. This workflow does not run the host or GPU tests,
+# install the application, sign/notarize it, or publish a release.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pyrowave-server
+    paths:
+      - .github/workflows/pyrowave-build.yml
+      - CMakeLists.txt
+      - cmake/**
+      - src/**
+      - src_assets/**
+      - third-party/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64:
+    name: macOS Apple Silicon / PyroWave Metal
+    runs-on: macos-15
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    env:
+      # This stable Xcode is listed in the macos-15-arm64 runner image.
+      # Pin it instead of inheriting the image's older default compiler/SDK.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: "14.2"
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      SHOULD_SIGN: "false"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+
+    steps:
+      - name: Checkout selected revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Select Node.js for the existing Web UI build
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238  # v6.2.0
+        with:
+          node-version: "22.22.2"
+
+      - name: Record build environment
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ "$(uname -m)" != "arm64" ]]; then
+            echo "Expected an Apple Silicon runner" >&2
+            exit 1
+          fi
+          {
+            sw_vers
+            uname -m
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun clang++ --version
+            node --version
+            npm --version
+            git rev-parse HEAD
+            git submodule status --recursive
+            shasum -a 256 cmake/patches/pyrowave-0.5.0-nt-handle-ownership.patch
+            cat src/pyrowave_runtime_contract.h
+          } 2>&1 | tee artifacts/environment.log
+
+      - name: Install build dependencies
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          # Match ci-macos.yml, omitting documentation tools. curl/sqlite expose
+          # the pkg-config packages required by dependencies/common.cmake.
+          brew install --force \
+            cmake ninja pkgconf icu4c@78 miniupnpc openssl@3 opus curl sqlite \
+            2>&1 | tee artifacts/dependencies.log
+          {
+            cmake --version
+            ninja --version
+            brew list --versions cmake ninja pkgconf icu4c@78 miniupnpc openssl@3 opus curl sqlite
+          } 2>&1 | tee -a artifacts/environment.log
+
+      - name: Configure host and optional Metal runtime
+        run: |
+          set -euo pipefail
+          export PKG_CONFIG_PATH="$(brew --prefix curl)/lib/pkgconfig:$(brew --prefix sqlite)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix opus)/lib/pkgconfig:$(brew --prefix icu4c@78)/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+          cmake -S . -B build/pyrowave-macos -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$(xcrun --find clang)" \
+            -DCMAKE_CXX_COMPILER="$(xcrun --find clang++)" \
+            -DCMAKE_CXX_STANDARD=23 \
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+            -DCMAKE_OBJCXX_STANDARD=23 \
+            -DCMAKE_OBJCXX_STANDARD_REQUIRED=ON \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET}" \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_WERROR=OFF \
+            -DSUNSHINE_ENABLE_PYROWAVE=ON \
+            -DSUNSHINE_ENABLE_WEBRTC=OFF \
+            -DSUNSHINE_BUILD_HOMEBREW=OFF \
+            -DICU_ROOT="$(brew --prefix icu4c@78)" \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DOpus_ROOT_DIR="$(brew --prefix opus)" \
+            -DAPPLE_CODESIGN_IDENTITY= \
+            2>&1 | tee artifacts/configure.log
+
+      - name: Compile sunshine target
+        run: |
+          set -euo pipefail
+          cmake --build build/pyrowave-macos --target sunshine \
+            --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}" \
+            2>&1 | tee artifacts/build.log
+
+      - name: Collect unsigned build output
+        run: |
+          set -euo pipefail
+          # Archive the build tree bundle without invoking install or CPack:
+          # those paths perform fixup/signing in the normal release workflow.
+          tar -czf artifacts/pyrowave-macos-arm64-build.tar.gz \
+            -C build/pyrowave-macos Vibepollo.app
+          cp -R build/pyrowave-macos/_deps/pyrowave/stage/licenses artifacts/pyrowave-licenses
+          shasum -a 256 \
+            build/pyrowave-macos/Vibepollo.app/Contents/MacOS/Vibepollo \
+            build/pyrowave-macos/Vibepollo.app/Contents/Frameworks/libpyrowave-metal.0.dylib \
+            artifacts/pyrowave-macos-arm64-build.tar.gz \
+            > artifacts/SHA256SUMS.txt
+          cat > artifacts/README.txt <<'EOF'
+          Compile-only Apple Silicon build with PyroWave enabled.
+          No host execution, screen capture, GPU validation, tests, signing,
+          notarization, installation or release publication was performed.
+          The archive contains the build-tree .app, not a redistributable package:
+          its ordinary Homebrew dependencies have not undergone bundle fixup.
+          Metal CPU input currently supports p8 profiles; this build does not
+          establish native HDR capture or p16 support on macOS.
+          See environment.log, configure.log, build.log and pyrowave-licenses
+          for the selected source revision, toolchain and runtime contract.
+          EOF
+
+      - name: Upload build output and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pyrowave-macos-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            artifacts/
+            build/pyrowave-macos/CMakeCache.txt
+            build/pyrowave-macos/CMakeFiles/CMakeConfigureLog.yaml
+            build/pyrowave-macos/compile_commands.json
+            build/pyrowave-macos/_deps/pyrowave/stage/licenses/

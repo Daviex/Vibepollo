@@ -27,6 +27,7 @@ parser.add_argument('--headers', type=Path, help='Vulkan-Headers include directo
 parser.add_argument('--compiler', default='C:/msys64/ucrt64/bin/g++.exe')
 args = parser.parse_args()
 source = args.source.resolve()
+repository = Path(__file__).resolve().parents[2]
 headers = (args.headers or source / 'Granite/third_party/khronos/vulkan-headers/include').resolve()
 c_api = (source / 'pyrowave_c.cpp').read_text(encoding='utf-8')
 common = (source / 'Granite/vulkan/vulkan_common.hpp').read_text(encoding='utf-8')
@@ -48,6 +49,7 @@ semaphore_close = body(semaphore, 'if (ExternalHandle::semaphore_handle_type_imp
 preamble = r'''
 #include <vulkan/vulkan_core.h>
 #include "pyrowave.h"
+#include "src/pyrowave_runtime_contract.h"
 #include <cassert>
 #include <cstdlib>
 #include <functional>
@@ -152,7 +154,7 @@ static void reset() {
   published = {};
 }
 int main() {
-  assert(std::string_view(pyrowave_vibepollo_runtime_contract()) == "d2997ac172bdc00e29c58e3f2938acb7e94580bf;nt-handle-ownership-v1");
+  assert(std::string_view(pyrowave_vibepollo_runtime_contract()) == ::pyrowave::runtime_contract);
   pyrowave_device_opaque device;
   VkImageCreateInfo vk {};
   vk.imageType = VK_IMAGE_TYPE_2D;
@@ -235,5 +237,5 @@ with tempfile.TemporaryDirectory(prefix='pyrowave-nt-ownership-') as directory:
     cpp = directory / 'ownership.cpp'
     executable = directory / 'ownership.exe'
     cpp.write_text(preamble + external + adapters + '\n' + runtime_contract + '\n' + image_create + '\n' + sync_create + tests, encoding='utf-8')
-    subprocess.run([args.compiler, '-std=c++17', '-O0', '-g', '-I', str(source), '-I', str(headers), str(cpp), '-o', str(executable)], check=True)
+    subprocess.run([args.compiler, '-std=c++17', '-O0', '-g', '-I', str(repository), '-I', str(source), '-I', str(headers), str(cpp), '-o', str(executable)], check=True)
     subprocess.run([str(executable)], check=True, timeout=15)

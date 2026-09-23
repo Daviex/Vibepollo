@@ -1948,6 +1948,8 @@ namespace config {
     string_f(vars, "fallback_mode", video.fallback_mode);
     bool_f(vars, "ignore_encoder_probe_failure", video.ignore_encoder_probe_failure);
     bool_f(vars, "pyrowave_enabled", video.pyrowave_enabled);
+    int_between_f(vars, "pyrowave_precision", video.pyrowave_precision, {-1, 2});
+    string_f(vars, "pyrowave_device_uuid", video.pyrowave_device_uuid);
 
     // Windows-only frame limiter options
     bool_f(vars, "frame_limiter_enable", frame_limiter.enable);

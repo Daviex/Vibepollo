@@ -2911,6 +2911,15 @@ namespace nvhttp {
             tree.put("root.PyroWaveProtocolVersion", pyrowave::protocol::version);
             tree.put("root.PyroWaveBitstreamRevision", std::string(pyrowave::protocol::bitstream_revision));
             tree.put("root.PyroWaveProfile", std::string(pyrowave::protocol::profile));
+            tree.put("root.PyroWaveProfileNegotiationVersion", pyrowave::protocol::profile_negotiation_version);
+            tree.put("root.PyroWaveProfileProbeRequired", 1);
+            boost::property_tree::ptree profiles;
+            for (const auto &name : video::pyrowave_profiles()) {
+              boost::property_tree::ptree profile;
+              profile.put_value(name);
+              profiles.add_child("Profile", profile);
+            }
+            tree.add_child("root.PyroWaveProfiles", profiles);
           }
         }
       }
@@ -3187,10 +3196,10 @@ namespace nvhttp {
       auto appid_str = get_arg(args, "appid", "0");
       const auto requested_pyrowave = get_arg(args, "pyrowave", "0");
       if (requested_pyrowave != "0" &&
-          (requested_pyrowave != "1" || !config::video.pyrowave_enabled || get_arg(args, "hdrMode", "0") != "0")) {
+          (requested_pyrowave != "1" || !config::video.pyrowave_enabled)) {
         tree.put("root.gamesession", 0);
         tree.put("root.<xmlattr>.status_code", 406);
-        tree.put("root.<xmlattr>.status_message", "PyroWave requires an enabled host and an SDR launch");
+        tree.put("root.<xmlattr>.status_message", "PyroWave requires an enabled host");
         return;
       }
       auto appuuid_str = get_arg(args, "appuuid", "");
@@ -3393,9 +3402,9 @@ namespace nvhttp {
 #endif
       const bool allow_display_changes = true;
       auto launch_session = make_launch_session_from_snapshot(host_audio, is_input_only, args, verified_client, &request_client_identity);
-      if (launch_session->pyrowave_requested && (is_input_only || rtsp_stream::effective_hdr_requested(*launch_session))) {
+      if (launch_session->pyrowave_requested && is_input_only) {
         tree.put("root.<xmlattr>.status_code", 406);
-        tree.put("root.<xmlattr>.status_message", "PyroWave requires an SDR video session; the host HDR policy is incompatible.");
+        tree.put("root.<xmlattr>.status_message", "PyroWave requires a video session.");
         tree.put("root.gamesession", 0);
         return;
       }
@@ -3764,10 +3773,10 @@ namespace nvhttp {
 
     const auto requested_pyrowave = get_arg(args, "pyrowave", "0");
     if (requested_pyrowave != "0" &&
-        (requested_pyrowave != "1" || !config::video.pyrowave_enabled || get_arg(args, "hdrMode", "0") != "0")) {
+        (requested_pyrowave != "1" || !config::video.pyrowave_enabled)) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 406);
-      tree.put("root.<xmlattr>.status_message", "PyroWave requires an enabled host and an SDR resume");
+      tree.put("root.<xmlattr>.status_message", "PyroWave requires an enabled host");
       return;
     }
 
@@ -3867,9 +3876,9 @@ namespace nvhttp {
     }
 
     auto launch_session = make_launch_session_from_snapshot(host_audio, is_input_only, args, verified_client, &request_client_identity);
-    if (launch_session->pyrowave_requested && (is_input_only || rtsp_stream::effective_hdr_requested(*launch_session))) {
+    if (launch_session->pyrowave_requested && is_input_only) {
       tree.put("root.<xmlattr>.status_code", 406);
-      tree.put("root.<xmlattr>.status_message", "PyroWave requires an SDR video session; the host HDR policy is incompatible.");
+      tree.put("root.<xmlattr>.status_message", "PyroWave requires a video session.");
       tree.put("root.resume", 0);
       return;
     }
@@ -4423,6 +4432,12 @@ namespace nvhttp {
     }
 
     const int updated = stream::set_bitrate_for_sessions(verified_client->uuid, applied);
+    if (updated < 0) {
+      tree.put("root.bitrate", 0);
+      tree.put("root.<xmlattr>.status_code", 406);
+      tree.put("root.<xmlattr>.status_message", "Requested bitrate cannot be applied within this session's negotiated limits");
+      return;
+    }
     if (updated <= 0) {
       BOOST_LOG(warning) << "Bitrate change requested by ["sv << verified_client->name << "] but no matching active session was found"sv;
       tree.put("root.bitrate", 0);

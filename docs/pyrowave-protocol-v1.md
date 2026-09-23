@@ -1,5 +1,8 @@
 # VibePollo PyroWave protocol, version 1
 
+> **PW-X extension status (23 September 2026):** This document records the original SDR 4:2:0 phase at commit `205c510c`. Its limits, hashes and test results are historical. For the extended implementation, use the [capability matrix](pyrowave-capability-matrix.md), [protocol v2](pyrowave-protocol-v2.md) and [extension build report](pyrowave-extension-build.md). The earlier results do not qualify HDR, 4:4:4 or the new transport/runtime paths.
+
+
 Status: implemented experimental Windows server contract, validated on the local
 hardware and within the limits recorded in the server reports. The client
 application is the subsequent phase. Work and evidence are tracked in Vikunja,

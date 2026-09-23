@@ -1,5 +1,8 @@
 # Convalida build PyroWave — server Windows
 
+> **PW-X extension status (23 September 2026):** This document records the original SDR 4:2:0 phase at commit `205c510c`. Its limits, hashes and test results are historical. For the extended implementation, use the [capability matrix](pyrowave-capability-matrix.md), [protocol v2](pyrowave-protocol-v2.md) and [extension build report](pyrowave-extension-build.md). The earlier results do not qualify HDR, 4:4:4 or the new transport/runtime paths.
+
+
 Data: 23 settembre 2026. Repository base: `8bf0ef7d3dbc0402e553deb93bb52e50447c4225`, con modifiche locali dell'implementazione PyroWave. Questo report riguarda compilazione, dipendenze e staging; le prove GPU sono descritte in [pyrowave-gpu-validation.md](pyrowave-gpu-validation.md). Non costituisce una dichiarazione di completamento dell'intero piano server.
 
 ## Risultati osservati

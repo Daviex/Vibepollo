@@ -3,6 +3,7 @@
  * @brief PyroWave C API adapter with a GPU-only D3D11 input path.
  */
 #include "pyrowave_runtime.h"
+#include "src/pyrowave_runtime_contract.h"
 
 #ifdef SUNSHINE_ENABLE_PYROWAVE
 
@@ -15,6 +16,7 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -34,6 +36,7 @@ namespace platf::pyrowave {
     constexpr std::size_t maximum_raw_bytes = 64 * 1024 * 1024;
     constexpr std::size_t native_packet_boundary = 64 * 1024;
     constexpr std::size_t maximum_native_packets = 65536;
+    constexpr std::size_t maximum_sideband_words = 32768;
     constexpr std::uint64_t gpu_wait_nanoseconds = 3'000'000'000;
 
     using statistics_clock_t = std::chrono::steady_clock;
@@ -77,9 +80,12 @@ namespace platf::pyrowave {
 
 #define PYROWAVE_ENTRY(name) decltype(&::name) name = nullptr
       PYROWAVE_ENTRY(pyrowave_get_api_version);
+      PYROWAVE_ENTRY(pyrowave_vibepollo_configure_precision);
       PYROWAVE_ENTRY(pyrowave_create_device_by_compat);
       PYROWAVE_ENTRY(pyrowave_device_set_queue_type);
       PYROWAVE_ENTRY(pyrowave_device_destroy);
+      PYROWAVE_ENTRY(pyrowave_vibepollo_device_activate);
+      PYROWAVE_ENTRY(pyrowave_device_report_performance_stats);
       PYROWAVE_ENTRY(pyrowave_image_create);
       PYROWAVE_ENTRY(pyrowave_image_get_image_view);
       PYROWAVE_ENTRY(pyrowave_image_destroy);
@@ -88,9 +94,13 @@ namespace platf::pyrowave {
       PYROWAVE_ENTRY(pyrowave_sync_object_cpu_wait);
       PYROWAVE_ENTRY(pyrowave_sync_object_destroy);
       PYROWAVE_ENTRY(pyrowave_encoder_create);
+      PYROWAVE_ENTRY(pyrowave_vibepollo_encoder_set_color_info);
       PYROWAVE_ENTRY(pyrowave_encoder_encode_gpu_synchronous);
       PYROWAVE_ENTRY(pyrowave_encoder_get_mapped_raw_bitstream);
       PYROWAVE_ENTRY(pyrowave_encoder_compute_num_packets);
+      PYROWAVE_ENTRY(pyrowave_encoder_compute_num_critical_packets);
+      PYROWAVE_ENTRY(pyrowave_encoder_get_num_active_blocks);
+      PYROWAVE_ENTRY(pyrowave_encoder_compute_block_active_words);
       PYROWAVE_ENTRY(pyrowave_encoder_packetize);
       PYROWAVE_ENTRY(pyrowave_encoder_destroy);
 #undef PYROWAVE_ENTRY
@@ -127,15 +137,18 @@ namespace platf::pyrowave {
         // ABI 0.5.0 alone is insufficient to accept an unpatched upstream DLL.
         using runtime_contract_fn = const char *(*)();
         const auto runtime_contract = std::bit_cast<runtime_contract_fn>(GetProcAddress(module.value, "pyrowave_vibepollo_runtime_contract"));
-        constexpr const char *expected_contract = "d2997ac172bdc00e29c58e3f2938acb7e94580bf;nt-handle-ownership-v1";
+        constexpr auto expected_contract = ::pyrowave::runtime_contract;
         const char *actual_contract = runtime_contract ? runtime_contract() : nullptr;
-        if (!actual_contract || std::strcmp(actual_contract, expected_contract) != 0) {
+        if (!actual_contract || actual_contract != expected_contract) {
           error = "PyroWave runtime contract is missing or incompatible; install the bundled pinned runtime";
           return false;
         }
+        PYROWAVE_LOAD(pyrowave_vibepollo_configure_precision);
         PYROWAVE_LOAD(pyrowave_create_device_by_compat);
         PYROWAVE_LOAD(pyrowave_device_set_queue_type);
         PYROWAVE_LOAD(pyrowave_device_destroy);
+        PYROWAVE_LOAD(pyrowave_vibepollo_device_activate);
+        PYROWAVE_LOAD(pyrowave_device_report_performance_stats);
         PYROWAVE_LOAD(pyrowave_image_create);
         PYROWAVE_LOAD(pyrowave_image_get_image_view);
         PYROWAVE_LOAD(pyrowave_image_destroy);
@@ -144,9 +157,13 @@ namespace platf::pyrowave {
         PYROWAVE_LOAD(pyrowave_sync_object_cpu_wait);
         PYROWAVE_LOAD(pyrowave_sync_object_destroy);
         PYROWAVE_LOAD(pyrowave_encoder_create);
+        PYROWAVE_LOAD(pyrowave_vibepollo_encoder_set_color_info);
         PYROWAVE_LOAD(pyrowave_encoder_encode_gpu_synchronous);
         PYROWAVE_LOAD(pyrowave_encoder_get_mapped_raw_bitstream);
         PYROWAVE_LOAD(pyrowave_encoder_compute_num_packets);
+        PYROWAVE_LOAD(pyrowave_encoder_compute_num_critical_packets);
+        PYROWAVE_LOAD(pyrowave_encoder_get_num_active_blocks);
+        PYROWAVE_LOAD(pyrowave_encoder_compute_block_active_words);
         PYROWAVE_LOAD(pyrowave_encoder_packetize);
         PYROWAVE_LOAD(pyrowave_encoder_destroy);
 #undef PYROWAVE_LOAD
@@ -154,37 +171,104 @@ namespace platf::pyrowave {
       }
     };
 
-    struct process_context_t {
-      // Member order keeps the DLL loaded through device destruction. The
-      // shared owner also keeps this mutex alive if a session outlives the
-      // process cache's static reference during shutdown.
+    struct process_runtime_t {
+      // Granite keeps device dispatch tables, but volk's instance dispatch is
+      // global. Serialize C API groups and reactivate their instance each time.
       std::mutex mutex;
       api_t api;
-      pyrowave_device device = nullptr;
-      LUID luid {};
       bool attempted = false;
-      bool active_encoder = false;
-      std::atomic_bool poisoned {false};
+      bool available = false;
+      std::string load_error;
+      int precision = -1;
 
-      ~process_context_t() {
-        std::lock_guard lock {mutex};
-        if (device) api.pyrowave_device_destroy(device);
+      bool load() {
+        if (!attempted) {
+          attempted = true;
+          available = api.load(load_error);
+        }
+        return available;
       }
     };
 
-    std::shared_ptr<process_context_t> process_context() {
-      // Exactly one adapter/context per process. Repeated Vulkan device
-      // creation leaks handles even in the bare Vulkan control on this host;
-      // retain this bounded context across probes and capture reinitialization.
-      static const auto context = std::make_shared<process_context_t>();
-      return context;
+    std::shared_ptr<process_runtime_t> process_runtime() {
+      static const auto runtime = std::make_shared<process_runtime_t>();
+      return runtime;
+    }
+
+    struct process_context_t {
+      std::shared_ptr<process_runtime_t> runtime;
+      std::mutex &mutex;
+      api_t &api;
+      pyrowave_device device = nullptr;
+      LUID luid {};
+      bool attempted = false;
+      std::atomic_bool poisoned {false};
+
+      process_context_t(std::shared_ptr<process_runtime_t> shared_runtime, const LUID &identity):
+          runtime {std::move(shared_runtime)}, mutex {runtime->mutex}, api {runtime->api}, luid {identity} {
+      }
+
+      ~process_context_t() {
+        std::lock_guard lock {mutex};
+        if (device) {
+          api.pyrowave_vibepollo_device_activate(device);
+          api.pyrowave_device_destroy(device);
+        }
+      }
+    };
+
+    std::shared_ptr<process_context_t> process_context(const LUID &luid) {
+      struct registry_t {
+        // Declaration order and shared ownership retain the lock and DLL until
+        // every device/session is destroyed, including during process shutdown.
+        std::shared_ptr<process_runtime_t> runtime = process_runtime();
+        std::map<std::uint64_t, std::shared_ptr<process_context_t>> adapters;
+      };
+      static registry_t registry;
+      std::lock_guard lock {registry.runtime->mutex};
+      const auto key = (std::uint64_t(static_cast<std::uint32_t>(luid.HighPart)) << 32) | luid.LowPart;
+      auto &entry = registry.adapters[key];
+      if (!entry) entry = std::make_shared<process_context_t>(registry.runtime, luid);
+      // Retain one context for each actual adapter used. Avoid recreating Vulkan
+      // devices across probes/sessions (which leaks driver handles on this host).
+      return entry;
     }
   }  // namespace
 
+  bool configure_precision(int requested, int &effective, std::string &error) {
+    error.clear();
+    auto runtime = process_runtime();
+    std::lock_guard lock {runtime->mutex};
+    effective = runtime->precision;
+    if (requested < -1 || requested > 2) {
+      error = "PyroWave precision must be auto (-1), FP16 (0), mixed (1), or FP32 (2)";
+      return false;
+    }
+    if (!runtime->load()) {
+      error = runtime->load_error;
+      return false;
+    }
+    const auto result = runtime->api.pyrowave_vibepollo_configure_precision(requested, &runtime->precision);
+    effective = runtime->precision;
+    if (result != PYROWAVE_SUCCESS) {
+      error = "PyroWave wavelet precision is fixed after the first encoder; restart the host to change it";
+      return false;
+    }
+    return true;
+  }
+
+  int effective_precision() {
+    auto runtime = process_runtime();
+    std::lock_guard lock {runtime->mutex};
+    return runtime->precision;
+  }
+
   struct encoder_t::impl_t {
-    std::shared_ptr<process_context_t> cached_context = process_context();
-    api_t &api = cached_context->api;
-    bool context_lease = false;
+    std::shared_ptr<process_context_t> cached_context;
+    api_t &api;
+
+    explicit impl_t(const LUID &luid): cached_context {process_context(luid)}, api {cached_context->api} {
+    }
     // D3D resources outlive every imported Vulkan resource.
     std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 2> targets;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context;
@@ -213,6 +297,7 @@ namespace platf::pyrowave {
 
     ~impl_t() {
       std::lock_guard lock {cached_context->mutex};
+      if (device) api.pyrowave_vibepollo_device_activate(device);
       // Upstream teardown waits for submitted work. Do not free external D3D
       // resources first, even after a failed wait/device-loss notification.
       if (encoder) {
@@ -229,7 +314,6 @@ namespace platf::pyrowave {
       if (context) {
         context->Flush();
       }
-      if (context_lease) cached_context->active_encoder = false;
     }
 
     bool check(pyrowave_result result, const char *operation, std::string &error) {
@@ -243,23 +327,41 @@ namespace platf::pyrowave {
       return false;
     }
 
-    bool initialize(ID3D11Device *d3d_device, ID3D11DeviceContext *d3d_context, ID3D11Texture2D *luma, ID3D11Texture2D *chroma, const LUID &luid, std::string &error) {
+    bool check_resource(pyrowave_result result, const char *operation, std::string &error) {
+      if (result == PYROWAVE_SUCCESS) return true;
+      // Allocation/import rejection precedes submission by this encoder. Its
+      // resources unwind independently and must not stop other active sessions.
+      error = api_message(operation, result);
+      failed = true;
+      return false;
+    }
+
+    bool initialize(ID3D11Device *d3d_device, ID3D11DeviceContext *d3d_context, ID3D11Texture2D *luma, ID3D11Texture2D *chroma, const LUID &luid, const ::pyrowave::profile_t &profile, std::string &error) {
       std::array<D3D11_TEXTURE2D_DESC, 2> descriptions {};
       targets = {luma, chroma};
       for (unsigned plane = 0; plane < 2; ++plane) {
         auto &desc = descriptions[plane];
         targets[plane]->GetDesc(&desc);
-        if (desc.Format != (plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM) || !desc.Width || !desc.Height ||
+        const auto expected_format = profile.high_precision ?
+          (plane ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R16_UNORM) :
+          (plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM);
+        if (desc.Format != expected_format || !desc.Width || !desc.Height ||
             desc.ArraySize != 1 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 ||
             !(desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE)) {
-          error = "PyroWave requires shared R8 luma and R8G8 chroma textures";
+          error = "PyroWave requires shared luma/chroma UNORM textures matching the selected 8-bit or 16-bit profile";
           return false;
         }
       }
       const auto &desc = descriptions[0];
-      if ((desc.Width & 1) || (desc.Height & 1) || desc.Width > 8192 || desc.Height > 8192 ||
-          descriptions[1].Width != desc.Width / 2 || descriptions[1].Height != desc.Height / 2) {
-        error = "PyroWave requires even luma dimensions up to 8192 and half-size chroma";
+      const auto chroma_divisor = profile.chroma_444 ? 1u : 2u;
+      if ((!profile.chroma_444 && ((desc.Width & 1) || (desc.Height & 1))) || desc.Width > 16384 || desc.Height > 16384 ||
+          descriptions[1].Width != desc.Width / chroma_divisor || descriptions[1].Height != desc.Height / chroma_divisor) {
+        error = "PyroWave requires dimensions up to 16384, full-size chroma for 4:4:4 or even dimensions with half-size chroma for 4:2:0";
+        return false;
+      }
+
+      if (profile.input_plane_bytes(desc.Width, desc.Height) > ::pyrowave::maximum_input_plane_bytes) {
+        error = "PyroWave input planes exceed the host allocation limit";
         return false;
       }
 
@@ -279,22 +381,15 @@ namespace platf::pyrowave {
         error = "PyroWave process context failed; restart the host before retrying";
         return false;
       }
-      if (cached_context->attempted && (cached_context->luid.HighPart != luid.HighPart || cached_context->luid.LowPart != luid.LowPart)) {
-        error = "PyroWave is bound to a different adapter LUID; restart the host to change GPU";
-        return false;
-      }
-      if (cached_context->active_encoder) {
-        error = "PyroWave process context already has an active encoder";
-        return false;
-      }
       if (!cached_context->device) {
         cached_context->attempted = true;
-        cached_context->luid = luid;
-        if (!api.load(error)) {
+        auto &runtime = *cached_context->runtime;
+        if (!runtime.load()) {
           cached_context->poisoned = true;
-          error += "; restart the host before retrying PyroWave";
+          error = runtime.load_error + "; restart the host before retrying PyroWave";
           return false;
         }
+        if (!check(api.pyrowave_vibepollo_configure_precision(-1, &runtime.precision), "Read wavelet precision", error)) return false;
         pyrowave_luid identity {};
         static_assert(sizeof(identity.luid) == sizeof(luid));
         std::memcpy(identity.luid, &luid, sizeof(luid));
@@ -304,8 +399,9 @@ namespace platf::pyrowave {
         }
       }
       device = cached_context->device;
-      cached_context->active_encoder = true;
-      context_lease = true;
+      if (!check(api.pyrowave_vibepollo_device_activate(device), "Activate Vulkan instance", error)) {
+        return false;
+      }
 
       // Separate planes avoid D3D11/Vulkan multi-planar layout disagreements
       // observed on NVIDIA. The existing converter renders straight into these
@@ -326,7 +422,9 @@ namespace platf::pyrowave {
         VkImageCreateInfo vk {};
         vk.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         vk.imageType = VK_IMAGE_TYPE_2D;
-        vk.format = plane ? VK_FORMAT_R8G8_UNORM : VK_FORMAT_R8_UNORM;
+        vk.format = profile.high_precision ?
+          (plane ? VK_FORMAT_R16G16_UNORM : VK_FORMAT_R16_UNORM) :
+          (plane ? VK_FORMAT_R8G8_UNORM : VK_FORMAT_R8_UNORM);
         vk.extent = {descriptions[plane].Width, descriptions[plane].Height, 1};
         vk.mipLevels = vk.arrayLayers = 1;
         vk.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -338,13 +436,13 @@ namespace platf::pyrowave {
         image_info.external_handle = reinterpret_cast<pyrowave_os_handle>(shared_texture.value);
         image_info.handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
         image_info.image_create_info = &vk;
-        if (!check(api.pyrowave_image_create(&image_info, &images[plane]), "Import YUV plane", error)) {
+        if (!check_resource(api.pyrowave_image_create(&image_info, &images[plane]), "Import YUV plane", error)) {
           return false;
         }
         (void) shared_texture.release();  // Successful import consumes the NT handle.
       }
       for (unsigned plane = 0; plane < 3; ++plane) {
-        if (!check(api.pyrowave_image_get_image_view(images[plane ? 1 : 0], static_cast<VkImageAspectFlagBits>(VK_IMAGE_ASPECT_PLANE_0_BIT << plane), VK_IMAGE_USAGE_SAMPLED_BIT, &buffers.planes[plane]), "Create YUV plane view", error)) {
+        if (!check_resource(api.pyrowave_image_get_image_view(images[plane ? 1 : 0], static_cast<VkImageAspectFlagBits>(VK_IMAGE_ASPECT_PLANE_0_BIT << plane), VK_IMAGE_USAGE_SAMPLED_BIT, &buffers.planes[plane]), "Create YUV plane view", error)) {
           return false;
         }
       }
@@ -365,7 +463,7 @@ namespace platf::pyrowave {
       sync_info.external_handle = reinterpret_cast<pyrowave_os_handle>(shared_fence.value);
       sync_info.handle_type = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
       sync_info.semaphore_type = VK_SEMAPHORE_TYPE_TIMELINE;
-      if (!check(api.pyrowave_sync_object_create(&sync_info, &sync), "Import D3D11 fence", error)) {
+      if (!check_resource(api.pyrowave_sync_object_create(&sync_info, &sync), "Import D3D11 fence", error)) {
         return false;
       }
       (void) shared_fence.release();
@@ -374,8 +472,18 @@ namespace platf::pyrowave {
       encoder_info.device = device;
       encoder_info.width = static_cast<int>(desc.Width);
       encoder_info.height = static_cast<int>(desc.Height);
-      encoder_info.chroma = PYROWAVE_CHROMA_SUBSAMPLING_420;
-      return check(api.pyrowave_encoder_create(&encoder_info, &encoder), "Create PyroWave encoder", error);
+      encoder_info.chroma = profile.chroma_444 ? PYROWAVE_CHROMA_SUBSAMPLING_444 : PYROWAVE_CHROMA_SUBSAMPLING_420;
+      if (!check_resource(api.pyrowave_encoder_create(&encoder_info, &encoder), "Create PyroWave encoder", error)) {
+        return false;
+      }
+      const pyrowave_vibepollo_color_info color_info {
+        profile.primaries_bt2020 ? 1u : 0u,
+        profile.transfer_pq ? 1u : 0u,
+        profile.matrix_bt2020 ? 1u : 0u,
+        profile.full_range ? 0u : 1u,
+        profile.chroma_left ? 1u : 0u
+      };
+      return check_resource(api.pyrowave_vibepollo_encoder_set_color_info(encoder, &color_info), "Set PyroWave input color metadata", error);
     }
 
     bool wait_for_release(std::string &error) {
@@ -400,20 +508,36 @@ namespace platf::pyrowave {
 
   encoder_t::~encoder_t() = default;
 
-  std::unique_ptr<encoder_t> encoder_t::create(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Texture2D *luma_target, ID3D11Texture2D *chroma_target, const LUID &adapter_luid, std::string &error) {
+  std::unique_ptr<encoder_t> encoder_t::create(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Texture2D *luma_target, ID3D11Texture2D *chroma_target, const LUID &adapter_luid, const ::pyrowave::profile_t &profile, std::string &error) {
     error.clear();
     if (!device || !context || !luma_target || !chroma_target) {
       error = "Missing D3D11 input for PyroWave";
       return nullptr;
     }
-    auto impl = std::make_unique<impl_t>();
+    // Reject a forged/stale identity before allocating a persistent registry
+    // entry. Only adapters backing a real capture D3D device are cached.
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC adapter_desc {};
+    auto status = device->QueryInterface(IID_PPV_ARGS(dxgi_device.GetAddressOf()));
+    if (SUCCEEDED(status)) status = dxgi_device->GetAdapter(adapter.GetAddressOf());
+    if (SUCCEEDED(status)) status = adapter->GetDesc(&adapter_desc);
+    if (FAILED(status)) {
+      error = hresult_message("Resolve capture adapter identity", status);
+      return nullptr;
+    }
+    if (adapter_desc.AdapterLuid.HighPart != adapter_luid.HighPart || adapter_desc.AdapterLuid.LowPart != adapter_luid.LowPart) {
+      error = "PyroWave adapter LUID does not match the capture D3D device";
+      return nullptr;
+    }
+    auto impl = std::make_unique<impl_t>(adapter_luid);
     bool initialized;
     {
-      // Upstream configures global Vulkan entry points: one cached context and
-      // serialized resource creation/destruction prevent overlapping mutation.
+      // Upstream configures global Vulkan entry points. All C API operations
+      // share this lock; each group activates its own cached adapter instance.
       std::lock_guard lock {impl->cached_context->mutex};
       try {
-        initialized = impl->initialize(device, context, luma_target, chroma_target, adapter_luid, error);
+        initialized = impl->initialize(device, context, luma_target, chroma_target, adapter_luid, profile, error);
       } catch (const std::exception &failure) {
         if (impl->cached_context->attempted) impl->cached_context->poisoned = true;
         impl->failed = true;
@@ -432,10 +556,16 @@ namespace platf::pyrowave {
     return std::unique_ptr<encoder_t>(new encoder_t(std::move(impl)));
   }
 
+  std::unique_ptr<encoder_t> encoder_t::create(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Texture2D *luma_target, ID3D11Texture2D *chroma_target, const LUID &adapter_luid, std::string &error) {
+    return create(device, context, luma_target, chroma_target, adapter_luid, ::pyrowave::profile_t {}, error);
+  }
+
   bool encoder_t::prepare_target(std::string &error) {
+    std::lock_guard lock {impl->cached_context->mutex};
     impl_t::exception_guard_t exception_guard {*impl};
     const auto start = statistics_clock_t::now();
     error.clear();
+    if (!impl->check(impl->api.pyrowave_vibepollo_device_activate(impl->device), "Activate Vulkan instance", error)) return false;
     // A newer converted frame may replace a frame which was deliberately not
     // submitted (e.g. the startup dummy). There is no Vulkan ownership yet.
     impl->conversion_ready = false;
@@ -448,7 +578,7 @@ namespace platf::pyrowave {
   bool encoder_t::submit_conversion(std::string &error) {
     const auto start = statistics_clock_t::now();
     error.clear();
-    if (impl->failed || impl->pending_release != 0 || impl->timeline >= std::numeric_limits<std::uint64_t>::max() - 2) {
+    if (impl->failed || impl->cached_context->poisoned || impl->pending_release != 0 || impl->timeline >= std::numeric_limits<std::uint64_t>::max() - 2) {
       error = "Invalid PyroWave conversion state";
       return false;
     }
@@ -466,21 +596,23 @@ namespace platf::pyrowave {
   }
 
   std::optional<packet_list_t> encoder_t::encode(std::size_t target_bytes, std::string &error) {
+    std::lock_guard lock {impl->cached_context->mutex};
     impl_t::exception_guard_t exception_guard {*impl};
     const auto encode_start = statistics_clock_t::now();
     error.clear();
     target_bytes &= ~std::size_t {3};
-    if (impl->failed || !impl->conversion_ready || target_bytes < 8 || target_bytes > maximum_target_bytes) {
+    if (impl->failed || impl->cached_context->poisoned || !impl->conversion_ready || target_bytes < 8 || target_bytes > maximum_target_bytes) {
       error = "Invalid PyroWave frame state or byte budget";
       return std::nullopt;
     }
+    if (!impl->check(impl->api.pyrowave_vibepollo_device_activate(impl->device), "Activate Vulkan instance", error)) return std::nullopt;
     impl->conversion_ready = false;
     pyrowave_gpu_external_reference external[2] {{impl->images[0], VK_QUEUE_FAMILY_EXTERNAL}, {impl->images[1], VK_QUEUE_FAMILY_EXTERNAL}};
     const auto semaphore = impl->api.pyrowave_sync_object_get_semaphore(impl->sync);
     pyrowave_gpu_sync_operation acquire {external, 2, {semaphore, impl->timeline}};
     pyrowave_gpu_sync_operation release {external, 2, {semaphore, ++impl->timeline}};
     pyrowave_rate_control rate {target_bytes};
-    if (!impl->check(impl->api.pyrowave_encoder_encode_gpu_synchronous(impl->encoder, &acquire, &release, &impl->buffers, &rate), "Encode NV12 frame", error)) {
+    if (!impl->check(impl->api.pyrowave_encoder_encode_gpu_synchronous(impl->encoder, &acquire, &release, &impl->buffers, &rate), "Encode YCbCr frame", error)) {
       return std::nullopt;
     }
     impl->pending_release = release.sync.value;
@@ -543,6 +675,34 @@ namespace platf::pyrowave {
         }
         total += packet.size;
       }
+      for (int bands = 0; bands <= 4; ++bands) {
+        auto &critical_count = impl->statistics.critical_packets[bands];
+        if (!impl->check(impl->api.pyrowave_encoder_compute_num_critical_packets(impl->encoder, bands, native_packet_boundary, 0, &critical_count), "Count critical native packets", error)) {
+          return std::nullopt;
+        }
+        if (critical_count > packet_count) {
+          impl->failed = true;
+          impl->cached_context->poisoned = true;
+          error = "PyroWave returned an invalid critical packet count";
+          return std::nullopt;
+        }
+      }
+      auto &active_count = impl->statistics.active_block_count;
+      const int bands = impl->statistics.active_block_bands;
+      if (!impl->check(impl->api.pyrowave_encoder_get_num_active_blocks(impl->encoder, bands, &active_count), "Count sideband blocks", error)) {
+        return std::nullopt;
+      }
+      if (active_count > maximum_sideband_words * 32) {
+        impl->failed = true;
+        impl->cached_context->poisoned = true;
+        error = "PyroWave returned an invalid sideband block count";
+        return std::nullopt;
+      }
+      auto &active_words = impl->statistics.active_block_words;
+      active_words.resize((active_count + 31) / 32);
+      if (!impl->check(impl->api.pyrowave_encoder_compute_block_active_words(impl->encoder, bands, active_words.data(), active_words.size()), "Compute active-block sideband", error)) {
+        return std::nullopt;
+      }
       packet_list_t result;
       result.reserve(packet_count);
       for (const auto &packet : packets) {
@@ -562,6 +722,24 @@ namespace platf::pyrowave {
 
   frame_statistics_t encoder_t::last_frame_statistics() const {
     return impl->statistics;
+  }
+
+  std::vector<std::string> encoder_t::performance_statistics(bool reset) const {
+    std::lock_guard lock {impl->cached_context->mutex};
+    std::vector<std::string> messages;
+    if (impl->failed || impl->cached_context->poisoned) return messages;
+    if (impl->api.pyrowave_vibepollo_device_activate(impl->device) != PYROWAVE_SUCCESS) return messages;
+    // Never propagate C++ exceptions across the C callback boundary.
+    const auto append = [](void *userdata, const char *message) {
+      auto &output = *static_cast<std::vector<std::string> *>(userdata);
+      try {
+        if (message && output.size() < 128) output.emplace_back(message);
+      } catch (...) {
+        // Diagnostics are best effort and must not terminate a healthy stream.
+      }
+    };
+    impl->api.pyrowave_device_report_performance_stats(impl->device, append, &messages, reset);
+    return messages;
   }
 }  // namespace platf::pyrowave
 

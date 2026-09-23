@@ -6,6 +6,31 @@ Data: 23 settembre 2026. Baseline VibePollo analizzata: `8bf0ef7d3dbc0402e553deb
 
 Integrare PyroWave nel server VibePollo come codec sperimentale opzionale, preparandone il contratto per il successivo sviluppo del client.
 
+### Estensione completa richiesta il 23 settembre 2026 — in corso
+
+La richiesta successiva amplia l'obiettivo a tutte le capacità attualmente offerte da PyroWave. Il confronto con upstream conferma che `master` coincide ancora con il pin `d2997ac172bdc00e29c58e3f2938acb7e94580bf`. La [matrice delle capacità](pyrowave-capability-matrix.md) registra funzionalità, prove disponibili e lavoro ancora aperto. Le evidenze della prima fase riportate sotto riguardano **SDR 4:2:0** e non qualificano automaticamente i nuovi percorsi.
+
+Il piano operativo aggiunto in **Vikunja → VibePollo → PyroWave — Server** è:
+
+| Attività | ID Vikunja | Risultato richiesto |
+| --- | --- | --- |
+| PW-X00 | 167 | Inventario completo e criteri di completamento |
+| PW-X01 | 168 | Profili colore espliciti e negoziazione v2 compatibile con v1 |
+| PW-X02 | 169 | Metadati VUI reali e piani GPU 8/16 bit, 420/444 |
+| PW-X03 | 170 | Conversione GPU SDR, wide gamut, PQ/HDR e chroma siting |
+| PW-X04 | 171 | Cattura, probe per profilo, capability e metadati HDR |
+| PW-X05 | 172 | Aggiornamento bitrate per fotogramma senza ricreare l'encoder |
+| PW-X06 | 173 | Frammenti nativi, recupero parziale e protezione dei dati critici |
+| PW-X07 | 174 | Precisione wavelet configurabile e diagnostica GPU |
+| PW-X08 | 175 | Contesti per adattatore e più encoder |
+| PW-X09 | 176 | Backend host Linux/ARM Vulkan |
+| PW-X10 | 177 | Backend host macOS Metal con capacità specifiche upstream |
+| PW-X11 | 178 | Build, documentazione, packaging e audit finale della copertura |
+
+La prima sequenza di lavoro è X00 → X01 → X02/X03 → X04; X05 e X06 estendono il trasporto, X07/X08 il runtime. I backend X09/X10 devono pubblicare le proprie capacità effettive. X11 dipende dall'intero inventario: attività incomplete e hardware non qualificato restano visibili. Il client applicativo continua a essere la fase successiva; contratto e dati di riferimento sono parte del lavoro server.
+
+### Prima fase sperimentale — baseline storica
+
 La pianificazione comprende una attività di analisi (PW-S00) e undici attività implementative (PW-S01–PW-S11), collegate da 23 dipendenze in Vikunja. La fase server sperimentale è implementata sul branch `codex/pyrowave-server`, con build Windows x64 OFF/ON, pacchetto locale e contratto per la successiva fase client. Le evidenze e i limiti sono registrati nelle rispettive attività e nei report.
 
 La verifica finale comprende 71 test dei componenti, 21 casi RTSP ON e 6 OFF, cattura e decodifica di 45 fotogrammi per ciascuno dei percorsi DXGI e WGC, e 13 probe consecutivi con 437 handle invariati. Sono stati corretti i problemi di colore e di gestione delle risorse emersi durante le prove. Il [report GPU](pyrowave-gpu-validation.md) distingue i benchmark storici dalle regressioni sull'ultima build; il [report RTSP](pyrowave-rtsp-validation.md) documenta cattura→codifica→UDP→decoder di riferimento e arresto della sessione.

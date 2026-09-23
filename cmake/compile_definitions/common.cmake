@@ -119,6 +119,9 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/pyrowave_protocol.h"
         "${CMAKE_SOURCE_DIR}/src/pyrowave_negotiation.cpp"
         "${CMAKE_SOURCE_DIR}/src/pyrowave_negotiation.h"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave_profile.h"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave_colors.h"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave_colors.cpp"
         "${CMAKE_SOURCE_DIR}/src/stream.h"
         "${CMAKE_SOURCE_DIR}/src/video.cpp"
         "${CMAKE_SOURCE_DIR}/src/video_policy.cpp"
@@ -187,6 +190,24 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/host_stats_service.h"
         "${CMAKE_SOURCE_DIR}/src/host_stats_types.h"
         ${PLATFORM_TARGET_FILES})
+
+if(SUNSHINE_ENABLE_PYROWAVE AND (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    list(APPEND SUNSHINE_TARGET_FILES
+        "${CMAKE_SOURCE_DIR}/src/platform/pyrowave_cpu_device.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/pyrowave_cpu_device.h")
+    if(APPLE)
+        list(APPEND SUNSHINE_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/platform/pyrowave_metal_runtime.mm"
+            "${CMAKE_SOURCE_DIR}/src/platform/pyrowave_metal_runtime.h")
+        find_library(SUNSHINE_PYROWAVE_METAL_FRAMEWORK Metal REQUIRED)
+        list(APPEND SUNSHINE_EXTERNAL_LIBRARIES ${SUNSHINE_PYROWAVE_METAL_FRAMEWORK})
+    else()
+        list(APPEND SUNSHINE_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/platform/pyrowave_cpu_runtime.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/pyrowave_cpu_runtime.h")
+        list(APPEND SUNSHINE_EXTERNAL_LIBRARIES ${CMAKE_DL_LIBS})
+    endif()
+endif()
 
 if(NOT SUNSHINE_ASSETS_DIR_DEF)
     set(SUNSHINE_ASSETS_DIR_DEF "${SUNSHINE_ASSETS_DIR}")

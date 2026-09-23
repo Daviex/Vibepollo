@@ -3,9 +3,14 @@
  * @brief Definitions for KMS screen capture.
  */
 // standard includes
+#include <array>
+#include <bit>
+#include <cmath>
 #include <errno.h>
 #include <fcntl.h>
 #include <filesystem>
+#include <limits>
+#include <new>
 #include <thread>
 #include <unistd.h>
 
@@ -1162,6 +1167,8 @@ namespace platf {
       }
 
       int init(const std::string &display_name, const ::video::config_t &config) {
+        pyrowave_capture = config.videoFormat == ::video::codec_wire_value(::video::codec_e::pyrowave);
+        if (pyrowave_capture && config.framerate <= 0) return -1;
         if (!gbm::create_device) {
           BOOST_LOG(warning) << "libgbm not initialized"sv;
           return -1;
@@ -1169,6 +1176,22 @@ namespace platf {
 
         if (display_t::init(display_name, config)) {
           return -1;
+        }
+
+        if (pyrowave_capture) {
+          const auto hdr = pyrowave_hdr_mode();
+          if (!hdr) return -1;
+          pyrowave_hdr = *hdr;
+          if (!pyrowave_image_size()) {
+            BOOST_LOG(error) << "PyroWave KMS capture dimensions exceed the bounded image allocation";
+            return -1;
+          }
+          if (pyrowave_hdr) {
+            plane_t plane = drmModeGetPlane(card.fd.el, plane_id);
+            if (!plane) return -1;
+            const auto fb = card.fb(plane.get());
+            if (!fb || !pyrowave_hdr_fourcc(fb->pixel_format) || !pyrowave_hdr_color_state()) return -1;
+          }
         }
 
         gbm.reset(gbm::create_device(card.fd.el));
@@ -1254,6 +1277,10 @@ namespace platf {
       }
 
       void blend_cursor(img_t &img) {
+        if (pyrowave_capture && pyrowave_hdr) {
+          blend_pyrowave_hdr_cursor(img);
+          return;
+        }
         // TODO: Cursor scaling is not supported in this codepath.
         // We always draw the cursor at the source size.
         auto pixels = (int *) img.data;
@@ -1312,6 +1339,13 @@ namespace platf {
           return status;
         }
 
+        if (pyrowave_capture) {
+          const auto hdr = pyrowave_hdr_mode();
+          if (!hdr) return capture_e::error;
+          if (*hdr != pyrowave_hdr) return capture_e::reinit;
+          if (pyrowave_hdr && (!pyrowave_hdr_fourcc(sd.fourcc) || !pyrowave_hdr_color_state())) return capture_e::error;
+        }
+
         auto rgb_opt = egl::import_source(display.get(), sd);
 
         if (!rgb_opt) {
@@ -1329,11 +1363,58 @@ namespace platf {
         gl::ctx.GetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
         BOOST_LOG(debug) << "width and height: w "sv << w << " h "sv << h;
 
+        if (pyrowave_capture) {
+          if (img_offset_x < 0 || img_offset_y < 0 ||
+              std::int64_t(img_offset_x) + width > w || std::int64_t(img_offset_y) + height > h) {
+            BOOST_LOG(error) << "PyroWave KMS capture rectangle is outside the imported texture";
+            return capture_e::error;
+          }
+          if (pyrowave_hdr) {
+            // Reading UNORM10 as UNSIGNED_SHORT preserves the original codes;
+            // importing through an 8-bit EGL texture would already have lost HDR precision.
+            for (const auto component : {GL_TEXTURE_RED_SIZE, GL_TEXTURE_GREEN_SIZE, GL_TEXTURE_BLUE_SIZE}) {
+              GLint bits = 0;
+              gl::ctx.GetTexLevelParameteriv(GL_TEXTURE_2D, 0, component, &bits);
+              if (bits < 10) {
+                BOOST_LOG(error) << "PyroWave KMS HDR import did not retain at least ten bits per RGB component";
+                return capture_e::error;
+              }
+            }
+          }
+        }
+
         if (!pull_free_image_cb(img_out)) {
           return platf::capture_e::interrupted;
         }
 
-        gl::ctx.GetTextureSubImage(rgb->tex[0], 0, img_offset_x, img_offset_y, 0, width, height, 1, GL_BGRA, GL_UNSIGNED_BYTE, img_out->height * img_out->row_pitch, img_out->data);
+        if (pyrowave_capture) {
+          const auto bytes = pyrowave_image_size();
+          const int pixel_bytes = pyrowave_hdr ? 8 : 4;
+          if (!bytes || !img_out || !img_out->data || img_out->width != width || img_out->height != height ||
+              img_out->pixel_pitch != pixel_bytes || img_out->row_pitch != width * pixel_bytes) {
+            BOOST_LOG(error) << "PyroWave KMS capture image has an invalid format or stride";
+            return capture_e::error;
+          }
+          gl::ctx.PixelStorei(GL_PACK_ALIGNMENT, 1);
+          gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, 0);
+          gl::ctx.PixelStorei(GL_PACK_IMAGE_HEIGHT, 0);
+          gl::ctx.PixelStorei(GL_PACK_SKIP_PIXELS, 0);
+          gl::ctx.PixelStorei(GL_PACK_SKIP_ROWS, 0);
+          gl::ctx.PixelStorei(GL_PACK_SKIP_IMAGES, 0);
+          gl::ctx.PixelStorei(GL_PACK_SWAP_BYTES, std::endian::native == std::endian::big ? GL_TRUE : GL_FALSE);
+          gl::ctx.GetTextureSubImage(rgb->tex[0], 0, img_offset_x, img_offset_y, 0, width, height, 1,
+                                    GL_BGRA, pyrowave_hdr ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE,
+                                    static_cast<GLsizei>(*bytes), img_out->data);
+          const auto readback_error = gl::ctx.GetError();
+          if (readback_error != GL_NO_ERROR) {
+            BOOST_LOG(error) << "PyroWave KMS image readback failed: " << util::hex(readback_error).to_string_view();
+            return capture_e::error;
+          }
+          img_out->pyrowave_pixel_format = pyrowave_hdr ? ::pyrowave::colors::input_format_e::bgra16_pq2020 :
+                                                         ::pyrowave::colors::input_format_e::bgra8_srgb;
+        } else {
+          gl::ctx.GetTextureSubImage(rgb->tex[0], 0, img_offset_x, img_offset_y, 0, width, height, 1, GL_BGRA, GL_UNSIGNED_BYTE, img_out->height * img_out->row_pitch, img_out->data);
+        }
 
         img_out->frame_timestamp = frame_timestamp;
 
@@ -1345,6 +1426,24 @@ namespace platf {
       }
 
       std::shared_ptr<img_t> alloc_img() override {
+        if (pyrowave_capture) {
+          const auto bytes = pyrowave_image_size();
+          if (!bytes) return nullptr;
+          try {
+            auto img = std::make_shared<kms_img_t>();
+            img->width = width;
+            img->height = height;
+            img->pixel_pitch = pyrowave_hdr ? 8 : 4;
+            img->row_pitch = img->pixel_pitch * width;
+            img->pyrowave_pixel_format = pyrowave_hdr ? ::pyrowave::colors::input_format_e::bgra16_pq2020 :
+                                                       ::pyrowave::colors::input_format_e::bgra8_srgb;
+            img->data = new std::uint8_t[*bytes] {};
+            return img;
+          } catch (const std::bad_alloc &) {
+            BOOST_LOG(error) << "PyroWave KMS capture image allocation failed";
+            return nullptr;
+          }
+        }
         auto img = std::make_shared<kms_img_t>();
         img->width = width;
         img->height = height;
@@ -1356,8 +1455,144 @@ namespace platf {
       }
 
       int dummy_img(platf::img_t *img) override {
+        if (pyrowave_capture) {
+          const auto bytes = pyrowave_image_size();
+          if (!bytes || !img || !img->data || img->width != width || img->height != height ||
+              img->pixel_pitch != (pyrowave_hdr ? 8 : 4) || img->row_pitch != width * img->pixel_pitch) return -1;
+          std::fill_n(img->data, *bytes, std::uint8_t {0});
+        }
         return 0;
       }
+
+      std::optional<std::size_t> pyrowave_image_size() const {
+        if (width <= 0 || height <= 0 || width > 16384 || height > 16384) return std::nullopt;
+        const auto bytes = std::uint64_t(width) * height * (pyrowave_hdr ? 8 : 4);
+        if (bytes > ::pyrowave::maximum_input_plane_bytes || bytes > std::numeric_limits<GLsizei>::max()) return std::nullopt;
+        return static_cast<std::size_t>(bytes);
+      }
+
+      std::optional<bool> pyrowave_hdr_mode() {
+        if (!hdr_metadata_blob_id || *hdr_metadata_blob_id == 0) return false;
+        prop_blob_t blob = drmModeGetPropertyBlob(card.fd.el, *hdr_metadata_blob_id);
+        if (!blob || !blob->data || blob->length < sizeof(hdr_output_metadata)) {
+          BOOST_LOG(error) << "PyroWave KMS cannot validate the active HDR metadata blob";
+          return std::nullopt;
+        }
+        const auto *metadata = static_cast<const hdr_output_metadata *>(blob->data);
+        if (metadata->metadata_type != 0 || metadata->hdmi_metadata_type1.metadata_type != 0) {
+          BOOST_LOG(error) << "PyroWave KMS does not support this HDR metadata type";
+          return std::nullopt;
+        }
+        const auto eotf = metadata->hdmi_metadata_type1.eotf;
+        if (eotf == 0) return false;
+        if (eotf == 2) return true;
+        BOOST_LOG(error) << "PyroWave KMS requires SMPTE ST 2084 PQ for HDR capture; unsupported EOTF " << unsigned(eotf);
+        return std::nullopt;
+      }
+
+      bool pyrowave_hdr_fourcc(std::uint32_t fourcc) const {
+        switch (fourcc) {
+          case DRM_FORMAT_XRGB2101010:
+          case DRM_FORMAT_ARGB2101010:
+          case DRM_FORMAT_XBGR2101010:
+          case DRM_FORMAT_ABGR2101010:
+            return true;
+          default:
+            BOOST_LOG(error) << "PyroWave KMS HDR requires a normalized RGB10 framebuffer; unsupported fourcc " << util::hex(fourcc).to_string_view();
+            return false;
+        }
+      }
+
+      bool pyrowave_hdr_color_state() {
+        // HDR_OUTPUT_METADATA describes the signal at the connector, not the
+        // unprocessed framebuffer. Do not label a linear/unknown primary plane
+        // as PQ when a hardware transfer curve or matrix still follows it.
+        if (!connector_id) return false;
+        const auto connector = card.connector_props(*connector_id);
+        bool bt2020_rgb = false;
+        for (const auto &[property, value] : connector) {
+          if (!property || property->name != "Colorspace"sv) continue;
+          for (int i = 0; i < property->count_enums; ++i) {
+            if (property->enums[i].value == value && property->enums[i].name == "BT2020_RGB"sv) bt2020_rgb = true;
+          }
+        }
+        if (!bt2020_rgb) {
+          BOOST_LOG(error) << "PyroWave KMS HDR requires explicit BT2020_RGB connector colorimetry";
+          return false;
+        }
+        const auto crtc = card.crtc_props(crtc_id);
+        const auto plane = card.plane_props(plane_id);
+        if (crtc.empty() || plane.empty()) {
+          BOOST_LOG(error) << "PyroWave KMS cannot inspect the active HDR color pipeline";
+          return false;
+        }
+        const auto has_transform = [](const auto &properties) {
+          for (const auto &[property, value] : properties) {
+            if (!property || value == 0) continue;
+            const std::string_view name {property->name};
+            if (((name.find("LUT") != std::string_view::npos || name.find("CTM") != std::string_view::npos) && !name.ends_with("_SIZE")) ||
+                name.find("COLOR_PIPELINE") != std::string_view::npos || name.ends_with("_TF") ||
+                name == "DEGAMMA_MODE" || name == "GAMMA_MODE") return true;
+          }
+          return false;
+        };
+        if (has_transform(crtc) || has_transform(plane)) {
+          BOOST_LOG(error) << "PyroWave KMS HDR cannot capture a framebuffer with active hardware color transforms";
+          return false;
+        }
+        return true;
+      }
+
+      void blend_pyrowave_hdr_cursor(img_t &img) const {
+        if (!img.data || img.pixel_pitch != 8 || captured_cursor.src_w == 0 || captured_cursor.src_h == 0 ||
+            std::uint64_t(captured_cursor.src_w) * captured_cursor.src_h * 4 > captured_cursor.pixels.size()) return;
+        const auto x = std::int64_t(captured_cursor.x) - img_offset_x;
+        const auto y = std::int64_t(captured_cursor.y) - img_offset_y;
+        const auto left = std::max<std::int64_t>(0, x), top = std::max<std::int64_t>(0, y);
+        const auto right = std::min<std::int64_t>(img.width, x + captured_cursor.src_w);
+        const auto bottom = std::min<std::int64_t>(img.height, y + captured_cursor.src_h);
+        if (left >= right || top >= bottom) return;
+        const auto srgb_to_linear = [](double value) {
+          return value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+        };
+        const auto pq_to_nits = [](double value) {
+          const auto p = std::pow(std::clamp(value, 0.0, 1.0), 1.0 / 78.84375);
+          return 10000.0 * std::pow(std::max(p - 0.8359375, 0.0) / std::max(18.8515625 - 18.6875 * p, 1e-12), 1.0 / 0.1593017578125);
+        };
+        const auto nits_to_pq = [](double value) {
+          const auto p = std::pow(std::clamp(value / 10000.0, 0.0, 1.0), 0.1593017578125);
+          return std::pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375);
+        };
+        for (auto row = top; row < bottom; ++row) {
+          for (auto col = left; col < right; ++col) {
+            const auto *cursor = captured_cursor.pixels.data() + (std::size_t(row - y) * captured_cursor.src_w + std::size_t(col - x)) * 4;
+            const double alpha = cursor[3] / 255.0;
+            if (alpha == 0) continue;
+            // ARGB8888 cursor pixels are premultiplied in sRGB. Recover their
+            // straight color before transfer decoding, then blend in linear nits.
+            const auto r = srgb_to_linear(std::min(1.0, cursor[2] / (255.0 * alpha)));
+            const auto g = srgb_to_linear(std::min(1.0, cursor[1] / (255.0 * alpha)));
+            const auto b = srgb_to_linear(std::min(1.0, cursor[0] / (255.0 * alpha)));
+            const std::array<double, 3> cursor_bgr {
+              80.0 * (0.016391439 * r + 0.088013308 * g + 0.895595253 * b),
+              80.0 * (0.069097289 * r + 0.919540395 * g + 0.011362316 * b),
+              80.0 * (0.627403896 * r + 0.329283038 * g + 0.043313066 * b)};
+            auto *destination = img.data + std::size_t(row) * img.row_pitch + std::size_t(col) * 8;
+            for (unsigned channel = 0; channel < 3; ++channel) {
+              const auto code = std::uint16_t(destination[2 * channel]) | (std::uint16_t(destination[2 * channel + 1]) << 8);
+              const auto nits = alpha * cursor_bgr[channel] + (1.0 - alpha) * pq_to_nits(code / 65535.0);
+              const auto result = static_cast<std::uint16_t>(std::lround(nits_to_pq(nits) * 65535.0));
+              destination[2 * channel] = result & 255;
+              destination[2 * channel + 1] = result >> 8;
+            }
+            // Capture output is an opaque composed desktop.
+            destination[6] = destination[7] = 255;
+          }
+        }
+      }
+
+      bool pyrowave_capture = false;
+      bool pyrowave_hdr = false;
 
       gbm::gbm_t gbm;
       egl::display_t display;

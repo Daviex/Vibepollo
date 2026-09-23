@@ -47,6 +47,22 @@ install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets/web/"
         DESTINATION "${SUNSHINE_ASSETS_DIR}/web"
         COMPONENT assets)
 
+# Install this explicitly loaded library before macOS bundle fixup/signing. It
+# is absent from the executable's link graph, so fixup cannot discover it.
+if(SUNSHINE_ENABLE_PYROWAVE AND UNIX)
+    if(APPLE AND NOT SUNSHINE_BUILD_HOMEBREW)
+        set(_pyrowave_install_destination "${CMAKE_PROJECT_NAME}.app/Contents/Frameworks")
+        set(_pyrowave_license_destination "${CMAKE_PROJECT_NAME}.app/Contents/Resources/licenses/pyrowave")
+    else()
+        set(_pyrowave_install_destination "${SUNSHINE_PYROWAVE_RUNTIME_INSTALL_DIR}")
+        set(_pyrowave_license_destination "${CMAKE_INSTALL_DATAROOTDIR}/sunshine/licenses/pyrowave")
+    endif()
+    install(FILES "${SUNSHINE_PYROWAVE_RUNTIME_FILE}"
+        DESTINATION "${_pyrowave_install_destination}" COMPONENT Runtime)
+    install(DIRECTORY "${SUNSHINE_PYROWAVE_STAGE_DIR}/licenses/"
+        DESTINATION "${_pyrowave_license_destination}" COMPONENT Runtime)
+endif()
+
 # platform specific packaging
 if(WIN32)
     include(${CMAKE_MODULE_PATH}/packaging/windows.cmake)

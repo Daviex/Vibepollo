@@ -170,5 +170,7 @@ namespace stream {
    * @param bitrate_kbps New encoder bitrate in kbps (already clamped by the caller).
    * @return Number of sessions updated.
    */
+  // Returns the updated count, zero for no matching session, or -1 when matching
+  // sessions cannot admit this runtime rate without renegotiation.
   int set_bitrate_for_sessions(const std::string &client_uuid, int bitrate_kbps);
 }  // namespace stream

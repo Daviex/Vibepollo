@@ -11,6 +11,8 @@
 #include "video_policy.h"
 #include "thread_safe.h"
 #include "video_colorspace.h"
+#include "pyrowave_profile.h"
+#include "pyrowave_protocol.h"
 
 // standard includes
 #include <array>
@@ -83,6 +85,12 @@ namespace video {
     // Shared lifetime token reserves the single experimental GPU session and
     // records the adapter that passed its dedicated probe.
     std::shared_ptr<void> pyrowave_session_lease;
+    // The private profile is authoritative for PyroWave's independent color
+    // fields; legacy Sunshine colorspaces cannot represent all combinations.
+    pyrowave::profile_t pyrowave_profile {};
+    pyrowave::protocol::transport_config_t pyrowave_transport {};
+    // Immutable encoder-rate ceiling used with the original wire budget by ABR.
+    int pyrowave_negotiated_encoder_bitrate_kbps = 0;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
@@ -350,6 +358,9 @@ namespace video {
     std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
     std::chrono::steady_clock::time_point packet_enqueue_timestamp = std::chrono::steady_clock::now();
+    // Immutable frame-scoped budget, so an ABR update never races the sender.
+    std::uint32_t pyrowave_wire_byte_budget = 0;
+    std::uint32_t pyrowave_frame_budget = 0;
   };
 
   struct packet_raw_avcodec: packet_raw_t {
@@ -440,8 +451,9 @@ namespace video {
     std::string reason;
   };
 
-  pyrowave_probe_result_t probe_pyrowave(bool force = false);
-  std::shared_ptr<void> acquire_pyrowave_session();
+  pyrowave_probe_result_t probe_pyrowave(bool force = false, pyrowave::profile_t profile = {});
+  std::shared_ptr<void> acquire_pyrowave_session(pyrowave::profile_t profile = {});
+  std::vector<std::string> pyrowave_profiles();
 
   struct advertised_encoder_capabilities_t {
     int hevc_mode = 0;

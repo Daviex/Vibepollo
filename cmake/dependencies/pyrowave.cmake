@@ -5,10 +5,13 @@ if(NOT SUNSHINE_ENABLE_PYROWAVE)
     return()
 endif()
 
-if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
-        NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$" OR
-        CMAKE_GENERATOR_PLATFORM MATCHES "^(ARM64|ARM64EC|Win32)(,|$)")
-    message(FATAL_ERROR "SUNSHINE_ENABLE_PYROWAVE currently requires Windows x64.")
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
+        (NOT WIN32 AND NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    message(FATAL_ERROR "SUNSHINE_ENABLE_PYROWAVE requires a 64-bit Windows, Linux or macOS host.")
+endif()
+if(WIN32 AND (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$" OR
+        CMAKE_GENERATOR_PLATFORM MATCHES "^(ARM64|ARM64EC|Win32)(,|$)"))
+    message(FATAL_ERROR "The Windows PyroWave D3D11 interop backend requires x64.")
 endif()
 if(CMAKE_VERSION VERSION_LESS "3.27")
     message(FATAL_ERROR "SUNSHINE_ENABLE_PYROWAVE requires CMake 3.27 or newer.")
@@ -26,7 +29,21 @@ string(SHA256 _pyrowave_pin_id
 string(SUBSTRING "${_pyrowave_pin_id}" 0 12 _pyrowave_pin_id)
 set(SUNSHINE_PYROWAVE_SOURCE_DIR "${_pyrowave_root}/src-${_pyrowave_pin_id}")
 set(SUNSHINE_PYROWAVE_STAGE_DIR "${_pyrowave_root}/stage")
-set(SUNSHINE_PYROWAVE_RUNTIME_NAME "libpyrowave-shared-0.dll")
+set(SUNSHINE_PYROWAVE_BACKEND "Vulkan")
+set(_pyrowave_target pyrowave-shared)
+set(_pyrowave_source_subdir "")
+set(_pyrowave_header pyrowave.h)
+if(WIN32)
+    set(SUNSHINE_PYROWAVE_RUNTIME_NAME "libpyrowave-shared-0.dll")
+elseif(APPLE)
+    set(SUNSHINE_PYROWAVE_BACKEND "Metal")
+    set(_pyrowave_target pyrowave-metal)
+    set(_pyrowave_source_subdir metal)
+    set(_pyrowave_header pyrowave_metal.h)
+    set(SUNSHINE_PYROWAVE_RUNTIME_NAME "libpyrowave-metal.0.dylib")
+else()
+    set(SUNSHINE_PYROWAVE_RUNTIME_NAME "libpyrowave-shared.so.0")
+endif()
 set(SUNSHINE_PYROWAVE_RUNTIME_FILE
     "${SUNSHINE_PYROWAVE_STAGE_DIR}/$<CONFIG>/${SUNSHINE_PYROWAVE_RUNTIME_NAME}")
 set(SUNSHINE_PYROWAVE_DOWNLOAD_DIR "${_pyrowave_root}/downloads" CACHE PATH
@@ -71,6 +88,7 @@ set(_pyrowave_cmake_args
     "-DCMAKE_C_COMPILER:FILEPATH=${CMAKE_C_COMPILER}"
     "-DCMAKE_CXX_COMPILER:FILEPATH=${CMAKE_CXX_COMPILER}"
     "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY:PATH=${_pyrowave_binary_dir}/runtime/$<CONFIG>"
+    "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY:PATH=${_pyrowave_binary_dir}/runtime/$<CONFIG>"
     -DPYROWAVE_DEVEL:BOOL=OFF
     -DPYROWAVE_UTILS:BOOL=OFF
     -DPYROWAVE_FP32_STORAGE:BOOL=OFF
@@ -88,12 +106,23 @@ if(MSVC)
     list(APPEND _pyrowave_cmake_args
         "-DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
+if(APPLE)
+    # The Metal subproject has its own ObjC++ language and framework linkage.
+    # Preserve the host architecture/SDK/deployment target for bundle compatibility.
+    foreach(_setting CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET CMAKE_OSX_SYSROOT)
+        if(${_setting})
+            string(REPLACE ";" "|" _pyrowave_setting_value "${${_setting}}")
+            list(APPEND _pyrowave_cmake_args "-D${_setting}:STRING=${_pyrowave_setting_value}")
+        endif()
+    endforeach()
+endif()
 set(_pyrowave_configurations ${CMAKE_CONFIGURATION_TYPES} ${CMAKE_BUILD_TYPE})
 list(REMOVE_DUPLICATES _pyrowave_configurations)
 foreach(_pyrowave_config IN LISTS _pyrowave_configurations)
     string(TOUPPER "${_pyrowave_config}" _pyrowave_upper_config)
     list(APPEND _pyrowave_cmake_args
-        "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_${_pyrowave_upper_config}:PATH=${_pyrowave_binary_dir}/runtime/${_pyrowave_config}")
+        "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_${_pyrowave_upper_config}:PATH=${_pyrowave_binary_dir}/runtime/${_pyrowave_config}"
+        "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_${_pyrowave_upper_config}:PATH=${_pyrowave_binary_dir}/runtime/${_pyrowave_config}")
 endforeach()
 
 # Build only the shared C API, not upstream executables. Its existing fixed
@@ -101,7 +130,9 @@ endforeach()
 ExternalProject_Add(sunshine_pyrowave_runtime
     PREFIX "${_pyrowave_root}/projects/${_pyrowave_pin_id}/runtime"
     SOURCE_DIR "${SUNSHINE_PYROWAVE_SOURCE_DIR}"
+    SOURCE_SUBDIR "${_pyrowave_source_subdir}"
     BINARY_DIR "${_pyrowave_binary_dir}"
+    LIST_SEPARATOR "|"
     DOWNLOAD_COMMAND ""
     UPDATE_COMMAND ""
     PATCH_COMMAND "${CMAKE_COMMAND}"
@@ -111,33 +142,42 @@ ExternalProject_Add(sunshine_pyrowave_runtime
         "-DPATCH_SHA256=${SUNSHINE_PYROWAVE_PATCH_SHA256}"
         -P "${CMAKE_CURRENT_LIST_DIR}/../scripts/patch_pyrowave.cmake"
     CMAKE_ARGS ${_pyrowave_cmake_args}
-    BUILD_COMMAND "${CMAKE_COMMAND}" --build <BINARY_DIR> --config $<CONFIG> --target pyrowave-shared
+    BUILD_COMMAND "${CMAKE_COMMAND}" --build <BINARY_DIR> --config $<CONFIG> --target ${_pyrowave_target}
     INSTALL_COMMAND "${CMAKE_COMMAND}"
         "-DSOURCE_DIR=${SUNSHINE_PYROWAVE_SOURCE_DIR}"
         "-DRUNTIME_FILE=${_pyrowave_binary_dir}/runtime/$<CONFIG>/${SUNSHINE_PYROWAVE_RUNTIME_NAME}"
         "-DSTAGE_DIR=${SUNSHINE_PYROWAVE_STAGE_DIR}"
         "-DCONFIG=$<CONFIG>"
+        "-DBACKEND=${SUNSHINE_PYROWAVE_BACKEND}"
+        "-DCONTRACT_FILE=${CMAKE_SOURCE_DIR}/src/pyrowave_runtime_contract.h"
         "-DPINS_FILE=${CMAKE_CURRENT_LIST_DIR}/pyrowave-pins.cmake"
         -P "${CMAKE_CURRENT_LIST_DIR}/../scripts/stage_pyrowave.cmake"
     BUILD_BYPRODUCTS "${_pyrowave_binary_dir}/runtime/$<CONFIG>/${SUNSHINE_PYROWAVE_RUNTIME_NAME}"
     INSTALL_BYPRODUCTS "${SUNSHINE_PYROWAVE_RUNTIME_FILE}"
-        "${SUNSHINE_PYROWAVE_STAGE_DIR}/include/pyrowave/pyrowave.h"
+        "${SUNSHINE_PYROWAVE_STAGE_DIR}/include/pyrowave/${_pyrowave_header}"
     DEPENDS sunshine_pyrowave_volk sunshine_pyrowave_vulkan_headers)
 ExternalProject_Add_StepDependencies(sunshine_pyrowave_runtime patch
     "${SUNSHINE_PYROWAVE_PATCH_FILE}"
     "${CMAKE_CURRENT_LIST_DIR}/../scripts/patch_pyrowave.cmake")
 ExternalProject_Add_StepDependencies(sunshine_pyrowave_runtime install
     "${CMAKE_CURRENT_LIST_DIR}/../scripts/stage_pyrowave.cmake"
+    "${CMAKE_SOURCE_DIR}/src/pyrowave_runtime_contract.h"
     "${CMAKE_CURRENT_LIST_DIR}/pyrowave-pins.cmake")
 
 file(MAKE_DIRECTORY "${SUNSHINE_PYROWAVE_STAGE_DIR}/include")
 add_library(sunshine_pyrowave_api INTERFACE)
 target_include_directories(sunshine_pyrowave_api SYSTEM INTERFACE "${SUNSHINE_PYROWAVE_STAGE_DIR}/include")
 target_compile_definitions(sunshine_pyrowave_api INTERFACE SUNSHINE_ENABLE_PYROWAVE=1)
+if(UNIX)
+    include(GNUInstallDirs)
+    set(SUNSHINE_PYROWAVE_RUNTIME_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/sunshine")
+    target_compile_definitions(sunshine_pyrowave_api INTERFACE
+        SUNSHINE_PYROWAVE_RUNTIME_INSTALL_DIR="${CMAKE_INSTALL_FULL_LIBDIR}/sunshine")
+endif()
 add_dependencies(sunshine_pyrowave_api sunshine_pyrowave_runtime)
 list(APPEND SUNSHINE_EXTERNAL_LIBRARIES sunshine_pyrowave_api)
 list(APPEND SUNSHINE_TARGET_DEPENDENCIES sunshine_pyrowave_runtime)
 
 # Deliberately no target_link_libraries(... pyrowave-shared): the server loads
 # the ABI-checked DLL explicitly only when PyroWave is requested.
-message(STATUS "Optional PyroWave ${SUNSHINE_PYROWAVE_REVISION}: isolated shared C API build enabled")
+message(STATUS "Optional PyroWave ${SUNSHINE_PYROWAVE_REVISION}: isolated ${SUNSHINE_PYROWAVE_BACKEND} C API build enabled")

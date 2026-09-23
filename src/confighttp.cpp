@@ -68,6 +68,13 @@
 #include "host_stats.h"
 #include "video.h"
 #include "pyrowave_protocol.h"
+#if defined(_WIN32) && defined(SUNSHINE_ENABLE_PYROWAVE)
+  #include "platform/windows/pyrowave_runtime.h"
+#elif defined(__APPLE__) && defined(SUNSHINE_ENABLE_PYROWAVE)
+  #include "platform/pyrowave_metal_runtime.h"
+#elif defined(SUNSHINE_ENABLE_PYROWAVE)
+  #include "platform/pyrowave_cpu_runtime.h"
+#endif
 #include "webrtc_stream.h"
 
 #ifdef _WIN32
@@ -3417,6 +3424,20 @@ namespace confighttp {
     output["protocol_version"] = pyrowave::protocol::version;
     output["bitstream_revision"] = std::string(pyrowave::protocol::bitstream_revision);
     output["profile"] = std::string(pyrowave::protocol::profile);
+    output["profile_negotiation_version"] = pyrowave::protocol::profile_negotiation_version;
+    output["profiles"] = video::pyrowave_profiles();
+    output["profile_probe_required"] = true;
+    output["probe_profile"] = std::string(pyrowave::protocol::profile);
+    output["precision_requested"] = config::video.pyrowave_precision;
+#if defined(_WIN32) && defined(SUNSHINE_ENABLE_PYROWAVE)
+    output["precision_effective"] = platf::pyrowave::effective_precision();
+#elif defined(__APPLE__) && defined(SUNSHINE_ENABLE_PYROWAVE)
+    output["precision_effective"] = platf::pyrowave_metal::effective_precision();
+#elif defined(SUNSHINE_ENABLE_PYROWAVE)
+    output["precision_effective"] = platf::pyrowave_cpu::effective_precision();
+#else
+    output["precision_effective"] = nullptr;
+#endif
     send_response(response, output, "no-store");
   }
 

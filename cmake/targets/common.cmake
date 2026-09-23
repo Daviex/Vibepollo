@@ -30,15 +30,21 @@ target_link_libraries(sunshine ${SUNSHINE_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
 target_compile_definitions(sunshine PUBLIC ${SUNSHINE_DEFINITIONS})
 
 if(SUNSHINE_ENABLE_PYROWAVE)
-    # Refresh even when only the optional DLL changed and sunshine does not
+    # Refresh even when only the optional runtime changed and sunshine does not
     # relink. CMP0112 NEW (from our CMake 3.20 minimum) makes TARGET_FILE_DIR a
     # directory query without an implicit dependency back to sunshine.
+    set(_pyrowave_runtime_destination "$<TARGET_FILE_DIR:sunshine>")
+    if(APPLE AND NOT SUNSHINE_BUILD_HOMEBREW)
+        # Match bundle packaging/signing and avoid a second unsigned dylib in
+        # Contents/MacOS. The dynamic loader resolves this directory explicitly.
+        set(_pyrowave_runtime_destination "$<TARGET_FILE_DIR:sunshine>/../Frameworks")
+    endif()
     add_custom_target(sunshine_stage_pyrowave_runtime
-        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sunshine>"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${_pyrowave_runtime_destination}"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${SUNSHINE_PYROWAVE_RUNTIME_FILE}" "$<TARGET_FILE_DIR:sunshine>"
+            "${SUNSHINE_PYROWAVE_RUNTIME_FILE}" "${_pyrowave_runtime_destination}"
         DEPENDS sunshine_pyrowave_runtime
-        COMMENT "Staging the optional PyroWave runtime beside the server"
+        COMMENT "Staging the optional PyroWave runtime"
         VERBATIM)
     add_dependencies(sunshine sunshine_stage_pyrowave_runtime)
 endif()
@@ -47,6 +53,12 @@ endif()
 set_target_properties(sunshine PROPERTIES CXX_STANDARD 23
         VERSION ${PROJECT_VERSION}
         SOVERSION ${PROJECT_VERSION_MAJOR})
+if(APPLE)
+    # Existing .mm sources use CMake's CXX extension mapping and inherit the
+    # CXX23 setting above. Preserve this if a toolchain enables OBJCXX as its
+    # own language; do not force LANGUAGE CXX (-x c++ rejects Objective-C).
+    set_target_properties(sunshine PROPERTIES OBJCXX_STANDARD 23 OBJCXX_STANDARD_REQUIRED ON)
+endif()
 
 # CLion complains about unknown flags after running cmake, and cannot add symbols to the index for cuda files
 if(CUDA_INHERIT_COMPILE_OPTIONS)

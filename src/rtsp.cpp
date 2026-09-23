@@ -1643,15 +1643,14 @@ namespace rtsp_stream {
         if (key == "x-vp-pyrowave.pathMtu") {
           pyrowave_path_mtu = static_cast<std::uint32_t>(value);
         }
-        if ((key == "x-nv-video[0].maxFPS" && (value < 1 || value > 240)) ||
+        if ((key == "x-nv-video[0].maxFPS" && (value < 1 || value > std::numeric_limits<int>::max() / 1000)) ||
             (key == "x-ss-general.encryptionEnabled" && value > 7) ||
-            ((key == "x-nv-vqos[0].bw.maximumBitrateKbps" || key == "x-ml-video.configuredBitrateKbps") && value > 800000) ||
             (key == "x-nv-audio.surround.numChannels" && (value < 1 || value > 8)) ||
             (key == "x-nv-video[0].packetSize" && config::stream.packetsize >= config::PACKETSIZE_MIN &&
              config::stream.packetsize <= config::PACKETSIZE_MAX && value > config::stream.packetsize) ||
-            (key == "x-nv-video[0].dynamicRangeMode" && value != 0) ||
-            (key == "x-ss-video[0].chromaSamplingType" && value != 0) ||
-            (key == "x-nv-video[0].encoderCscMode" && value != 3)) {
+            (key == "x-nv-video[0].dynamicRangeMode" && value > 1) ||
+            (key == "x-ss-video[0].chromaSamplingType" && value > 1) ||
+            (key == "x-nv-video[0].encoderCscMode" && (value < 2 || value > 5))) {
           respond(socket->sock, *session, &option, 406, "Unsupported PyroWave profile", req->sequenceNumber, {});
           return false;
         }
@@ -1935,6 +1934,8 @@ namespace rtsp_stream {
         .fec_percentage = static_cast<std::uint32_t>(config::stream.fec_percentage),
         .min_fec_packets = static_cast<std::uint32_t>(config.minRequiredFecPackets),
         .encrypted = (config.encryptionFlagsEnabled & SS_ENC_VIDEO) != 0,
+        .fragmented = extension("x-vp-pyrowave.version") == "2",
+        .critical_fec_percentage = config::stream.fec_percentage == 0 ? 0u : std::max(40u, static_cast<std::uint32_t>(config::stream.fec_percentage)),
       };
       const auto negotiated = pyrowave::negotiation::negotiate({
         .width = config.monitor.width,
@@ -1957,12 +1958,16 @@ namespace rtsp_stream {
         respond(socket->sock, *session, &option, 406, "Unsupported PyroWave session", req->sequenceNumber, {});
         return false;
       }
-      config.monitor.pyrowave_protocol_version = pyrowave::protocol::version;
+      config.monitor.pyrowave_protocol_version = negotiated.negotiated_version;
+      config.monitor.pyrowave_profile = negotiated.profile;
+      config.monitor.pyrowave_transport = transport;
+      config.monitor.force_sdr = !negotiated.profile.transfer_pq;
       config.monitor.pyrowave_path_mtu = pyrowave_path_mtu;
       config.monitor.pyrowave_frame_budget = negotiated.frame_budget;
       config.monitor.pyrowave_wire_byte_budget = negotiated.wire_byte_budget;
       config.monitor.pyrowave_fec_percentage = transport.fec_percentage;
       config.monitor.pyrowave_encoder_target_bytes = negotiated.encoder_target_bytes;
+      config.monitor.pyrowave_negotiated_encoder_bitrate_kbps = config.monitor.bitrate;
       config.monitor.encodingFramerate = negotiated.fps_x100 * 10;
     }
 
@@ -2013,13 +2018,13 @@ namespace rtsp_stream {
         try {
           if (config.monitor.videoFormat == video::codec_wire_value(video::codec_e::pyrowave)) {
             startup_status = 406;
-            const auto probe = video::probe_pyrowave(true);
+            const auto probe = video::probe_pyrowave(true, config.monitor.pyrowave_profile);
             if (!probe.available) {
               throw std::runtime_error(probe.reason);
             }
-            config.monitor.pyrowave_session_lease = video::acquire_pyrowave_session();
+            config.monitor.pyrowave_session_lease = video::acquire_pyrowave_session(config.monitor.pyrowave_profile);
             if (!config.monitor.pyrowave_session_lease) {
-              throw std::runtime_error("PyroWave already has an active or pending session");
+              throw std::runtime_error("PyroWave profile admission probe expired or changed");
             }
           }
           stream_session = stream::session::alloc(config, *launch_session);

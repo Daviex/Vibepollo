@@ -12,7 +12,7 @@ set(SUNSHINE_PYROWAVE_GRANITE_ARCHIVE_SHA256 "286823300b7ee8b49694361287e3bf37c3
 set(SUNSHINE_PYROWAVE_VOLK_ARCHIVE_SHA256 "ed771f9132ea077af0abc74d29f415a81f181f83c3ac5e0f67b2f2149976fe2d")
 set(SUNSHINE_PYROWAVE_VULKAN_HEADERS_ARCHIVE_SHA256 "162e7e95e101dfe3118bef4abd0dd2a38f8308e5c61f60bfcef8c0e8783fc48c")
 
-# Local runtime fixes and an additive bundle-identity export. The upstream API
-# signatures and encoded bitstream remain pinned to the revisions above.
+# Local ownership/allocation fixes and additive VUI, device dispatch and precision
+# APIs. Upstream API/ABI signatures and the bitstream syntax remain pinned above.
 set(SUNSHINE_PYROWAVE_PATCH_FILE "${CMAKE_CURRENT_LIST_DIR}/../patches/pyrowave-0.5.0-nt-handle-ownership.patch")
-set(SUNSHINE_PYROWAVE_PATCH_SHA256 "ba9f00d2fda290d4fd93d5792b3f08100eb12e9e8fb92add5012a2e76302fc8d")
+set(SUNSHINE_PYROWAVE_PATCH_SHA256 "8f3b4ee860c114a753b3c32bff62fca44a915df94080e0916cfa494372ea36d2")

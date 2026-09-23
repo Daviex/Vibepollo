@@ -10,6 +10,9 @@
 #include "src/platform/macos/av_video.h"
 #include "src/platform/macos/misc.h"
 #include "src/platform/macos/nv12_zero_device.h"
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+  #include "src/platform/pyrowave_cpu_device.h"
+#endif
 
 // Avoid conflict between AVFoundation and libavutil both defining AVMediaType
 #define AVMediaType AVMediaType_FFmpeg
@@ -77,6 +80,15 @@ namespace platf {
     std::shared_ptr<img_t> alloc_img() override {
       return std::make_shared<av_img_t>();
     }
+
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+    std::unique_ptr<pyrowave_encode_device_t> make_pyrowave_encode_device() override {
+      // AVFoundation supplies SDR BGRA; the common converter generates the
+      // negotiated color planes. Metal explicitly rejects 16-bit input.
+      av_capture.pixelFormat = kCVPixelFormatType_32BGRA;
+      return make_pyrowave_cpu_encode_device(false);
+    }
+#endif
 
     std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e pix_fmt) override {
       if (pix_fmt == pix_fmt_e::yuv420p) {

@@ -1,5 +1,8 @@
 # PyroWave transport validation
 
+> **PW-X extension status (23 September 2026):** This document records the original SDR 4:2:0 phase at commit `205c510c`. Its limits, hashes and test results are historical. For the extended implementation, use the [capability matrix](pyrowave-capability-matrix.md), [protocol v2](pyrowave-protocol-v2.md) and [extension build report](pyrowave-extension-build.md). The earlier results do not qualify HDR, 4:4:4 or the new transport/runtime paths.
+
+
 Validated on Windows x64, 2026-09-23: **8/8 transport component tests passed**
 with MSYS2 UCRT64 GCC 15.2 and the bundled GoogleTest sources. The final direct
 run took 15 ms after compilation. These results concern the server transport

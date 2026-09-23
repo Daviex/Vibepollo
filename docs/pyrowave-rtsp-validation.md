@@ -1,5 +1,8 @@
 # Convalida RTSP PyroWave in loopback
 
+> **PW-X extension status (23 September 2026):** This document records the original SDR 4:2:0 phase at commit `205c510c`. Its limits, hashes and test results are historical. For the extended implementation, use the [capability matrix](pyrowave-capability-matrix.md), [protocol v2](pyrowave-protocol-v2.md) and [extension build report](pyrowave-extension-build.md). The earlier results do not qualify HDR, 4:4:4 or the new transport/runtime paths.
+
+
 Data: 23 settembre 2026. Questa prova usa gli oggetti del server Windows x64 MinGW compilato con il nuovo codec. Non avvia l'entry point dell'applicazione, non legge configurazioni o pairing di produzione e non rappresenta una convalida del futuro client.
 
 ## Risultati osservati

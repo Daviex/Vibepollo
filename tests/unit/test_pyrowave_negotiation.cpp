@@ -59,7 +59,7 @@ TEST(PyroWaveNegotiation, PreservesExactWireBudgetForSenderValidation) {
 }
 
 TEST(PyroWaveNegotiation, RequiresExactExplicitExtensionContract) {
-  for (const std::string_view version : {"", "0", "2", "01", "+1", "1 ", "1x", "999999999999999999999"}) {
+  for (const std::string_view version : {"", "0", "3", "01", "+1", "1 ", "1x", "999999999999999999999"}) {
     auto request = valid_request();
     request.version = version;
     expect_rejection(request);
@@ -93,8 +93,8 @@ TEST(PyroWaveNegotiation, RejectsHdrChromaAndColorChangesWithoutDownprofiling) {
 }
 
 TEST(PyroWaveNegotiation, AcceptsEvenAllocationCeilingsIndependentOfPerformance) {
-  for (const auto width : {64, 1920, 4096}) {
-    for (const auto height : {64, 1080, 4096}) {
+  for (const auto width : {2, 1920, 16384}) {
+    for (const auto height : {2, 1080, 16384}) {
       auto request = valid_request();
       request.width = width;
       request.height = height;
@@ -104,7 +104,7 @@ TEST(PyroWaveNegotiation, AcceptsEvenAllocationCeilingsIndependentOfPerformance)
 }
 
 TEST(PyroWaveNegotiation, RejectsOddNegativeAndExcessiveDimensions) {
-  for (const auto value : {std::numeric_limits<int>::min(), -2, 0, 62, 63, 65, 4095, 4097, 4098, std::numeric_limits<int>::max()}) {
+  for (const auto value : {std::numeric_limits<int>::min(), -2, 0, 1, 3, 65, 16383, 16385, 16386, std::numeric_limits<int>::max()}) {
     auto request = valid_request();
     request.width = value;
     expect_rejection(request);
@@ -116,7 +116,7 @@ TEST(PyroWaveNegotiation, RejectsOddNegativeAndExcessiveDimensions) {
 
 TEST(PyroWaveNegotiation, AcceptsIntegerAndConsistentFractionalFramerates) {
   const std::array<std::pair<int, int>, 9> rates {{{1, 0}, {24, 2397}, {24, 2398}, {30, 2997}, {60, 5994},
-                                               {60, 0}, {120, 11988}, {240, 23976}, {240, 24000}}};
+                                               {60, 0}, {120, 11988}, {240, 23976}, {480, 48000}}};
   for (const auto [integer, fractional] : rates) {
     auto request = valid_request();
     request.framerate = integer;
@@ -128,13 +128,13 @@ TEST(PyroWaveNegotiation, AcceptsIntegerAndConsistentFractionalFramerates) {
 }
 
 TEST(PyroWaveNegotiation, RejectsInvalidOrInconsistentFrameratesBeforeArithmetic) {
-  for (const auto value : {std::numeric_limits<int>::min(), -1, 0, 241, std::numeric_limits<int>::max()}) {
+  for (const auto value : {std::numeric_limits<int>::min(), -1, 0, std::numeric_limits<int>::max() / 1000 + 1, std::numeric_limits<int>::max()}) {
     auto request = valid_request();
     request.framerate = value;
     request.framerate_x100 = 0;
     expect_rejection(request);
   }
-  for (const auto value : {std::numeric_limits<int>::min(), -1, 1, 99, 100, 2997, 24001, std::numeric_limits<int>::max()}) {
+  for (const auto value : {std::numeric_limits<int>::min(), -1, 1, 99, 100, 2997, std::numeric_limits<int>::max() / 10 + 1, std::numeric_limits<int>::max()}) {
     auto request = valid_request();
     request.framerate_x100 = value;
     expect_rejection(request);
@@ -142,7 +142,7 @@ TEST(PyroWaveNegotiation, RejectsInvalidOrInconsistentFrameratesBeforeArithmetic
 }
 
 TEST(PyroWaveNegotiation, BoundsBothBitratesBeforeMultiplication) {
-  for (const auto bitrate : {std::numeric_limits<int>::min(), -1, 0, 999, 800001, std::numeric_limits<int>::max()}) {
+  for (const auto bitrate : {std::numeric_limits<int>::min(), -1, 0, 1, 4, 5}) {
     auto request = valid_request();
     request.encoder_bitrate_kbps = bitrate;
     expect_rejection(request);
@@ -150,7 +150,7 @@ TEST(PyroWaveNegotiation, BoundsBothBitratesBeforeMultiplication) {
     request.video_wire_bitrate_kbps = bitrate;
     expect_rejection(request);
   }
-  for (const auto bitrate : {1000, 800000}) {
+  for (const auto bitrate : {999, std::numeric_limits<int>::max()}) {
     auto request = valid_request();
     request.framerate = 1;
     request.framerate_x100 = 0;
@@ -165,8 +165,8 @@ TEST(PyroWaveNegotiation, UsesWideArithmeticAndCapsMaximumBitrateToTransport) {
   auto request = valid_request();
   request.framerate = 1;
   request.framerate_x100 = 0;
-  request.encoder_bitrate_kbps = 800000;
-  request.video_wire_bitrate_kbps = 800000;
+  request.encoder_bitrate_kbps = std::numeric_limits<int>::max();
+  request.video_wire_bitrate_kbps = std::numeric_limits<int>::max();
   const auto result = negotiation::negotiate(request, {});
   ASSERT_TRUE(result.accepted);
   const auto limits = protocol::transport_limits({});

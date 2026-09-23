@@ -41,8 +41,9 @@ namespace pyrowave::transport {
     }
   };
 
-  // Produces the same short-frame header and reserved NV/RTP slots consumed by
-  // the sender. The final data shard remains short until encode_block pads it.
+  // V1 produces its short-frame header and reserved NV/RTP slots. V2 inserts
+  // NV/RTP slots around self-contained PWPF payloads, with no short header.
+  // Only the final v1 data shard remains short until encode_block pads it.
   std::optional<std::vector<std::uint8_t>> packetize_frame(
     std::span<const std::uint8_t> frame,
     const protocol::transport_config_t &config,
