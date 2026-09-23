@@ -1,0 +1,235 @@
+diff --git a/Granite/vulkan/vulkan_common.hpp b/Granite/vulkan/vulkan_common.hpp
+--- a/Granite/vulkan/vulkan_common.hpp
++++ b/Granite/vulkan/vulkan_common.hpp
+@@ -60,6 +60,10 @@
+ 
+ 	VkExternalMemoryHandleTypeFlagBits memory_handle_type = get_opaque_memory_handle_type();
+ 	VkExternalSemaphoreHandleTypeFlagBits semaphore_handle_type = get_opaque_semaphore_handle_type();
++#ifdef _WIN32
++	// A wrapping API may defer NT handle consumption until its full operation commits.
++	bool consume_win32_handle_on_import = true;
++#endif
+ 
+ 	constexpr static VkExternalMemoryHandleTypeFlagBits get_opaque_memory_handle_type()
+ 	{
+diff --git a/Granite/vulkan/memory_allocator.cpp b/Granite/vulkan/memory_allocator.cpp
+--- a/Granite/vulkan/memory_allocator.cpp
++++ b/Granite/vulkan/memory_allocator.cpp
+@@ -769,7 +769,8 @@
+ 	    ExternalHandle::memory_handle_type_imports_by_reference(external->memory_handle_type))
+ 	{
+ #ifdef _WIN32
+-		::CloseHandle(external->handle);
++		if (external->consume_win32_handle_on_import)
++			::CloseHandle(external->handle);
+ #else
+ 		::close(external->handle);
+ #endif
+diff --git a/Granite/vulkan/semaphore.cpp b/Granite/vulkan/semaphore.cpp
+--- a/Granite/vulkan/semaphore.cpp
++++ b/Granite/vulkan/semaphore.cpp
+@@ -227,7 +227,8 @@
+ 	{
+ #ifdef _WIN32
+ 		// Consume the handle, since the VkSemaphore holds a reference on Win32.
+-		::CloseHandle(handle.handle);
++		if (handle.consume_win32_handle_on_import)
++			::CloseHandle(handle.handle);
+ #else
+ 		::close(handle.handle);
+ #endif
+diff --git a/Granite/vulkan/device.cpp b/Granite/vulkan/device.cpp
+--- a/Granite/vulkan/device.cpp
++++ b/Granite/vulkan/device.cpp
+@@ -3669,7 +3669,10 @@
+ 		if (memory)
+ 			table.vkFreeMemory(vkdevice, memory, nullptr);
+ 		if (allocator)
++		{
++			std::lock_guard<std::mutex> allocation_lock{device->lock.memory_lock};
+ 			allocation.free_immediate(*allocator);
++		}
+ 	}
+ };
+ 
+@@ -4070,6 +4073,10 @@
+                                                      const InitialImageBuffer *staging_buffer)
+ {
+ 	ImageResourceHolder holder(this);
++	// External allocations must also unwind on bind or wrapper-allocation failure.
++	// Successful ImageHandle creation transfers both resources via holder.owned.
++	if ((create_info.misc & IMAGE_MISC_EXTERNAL_MEMORY_BIT) != 0)
++		holder.allocator = &managers.memory;
+ 
+ 	VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+ 	info.format = create_info.format;
+diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
+--- a/pyrowave_c.cpp
++++ b/pyrowave_c.cpp
+@@ -10,6 +10,12 @@
+ #include "pyrowave_encoder.hpp"
+ #include "logging.hpp"
+ 
++#include <memory>
++#include <new>
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
+ using namespace Granite;
+ using namespace Vulkan;
+ using namespace PyroWave;
+@@ -29,6 +35,12 @@
+ static NullLogger null_logger;
+ 
+ extern "C" {
++// Local VibePollo extension: checked before creating any GPU resources.
++const char *pyrowave_vibepollo_runtime_contract(void)
++{
++	return "d2997ac172bdc00e29c58e3f2938acb7e94580bf;nt-handle-ownership-v1";
++}
++
+ void pyrowave_get_api_version(uint32_t *major, uint32_t *minor, uint32_t *patch)
+ {
+ 	*major = PYROWAVE_API_VERSION_MAJOR;
+@@ -439,7 +451,7 @@
+ {
+ 	Util::set_thread_logging_interface(&null_logger);
+ 
+-	if (!info->device)
++	if (!info || !out_sync || !info->device)
+ 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+ 
+ 	if ((info->handle_type & (
+@@ -457,6 +469,11 @@
+ 	if (!device.get_device_features().supports_external)
+ 		return PYROWAVE_ERROR_NOT_IMPLEMENTED;
+ 
++	// Allocate the public wrapper before importing/consuming any caller handle.
++	std::unique_ptr<pyrowave_sync_object_opaque> sync(new (std::nothrow) pyrowave_sync_object_opaque());
++	if (!sync)
++		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
++
+ 	auto sem = device.request_semaphore_external(info->semaphore_type, info->handle_type);
+ 	if (!sem)
+ 		return PYROWAVE_ERROR_UNSUPPORTED_EXTERNAL_HANDLE;
+@@ -464,17 +481,24 @@
+ 	ExternalHandle ext = {};
+ 	ext.handle = (decltype(ext.handle))info->external_handle;
+ 	ext.semaphore_handle_type = info->handle_type;
++#ifdef _WIN32
++	ext.consume_win32_handle_on_import = false;
++#endif
+ 	if (ext && !sem->import_from_handle(ext))
+ 		return PYROWAVE_ERROR_FAILED_EXTERNAL_HANDLE;
+ 
+ 	if (!ext && !(info->import_flags & VK_SEMAPHORE_IMPORT_TEMPORARY_BIT))
+ 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+ 
+-	auto *sync = new pyrowave_sync_object_opaque();
+ 	sync->device = &device;
+ 	sync->semaphore = std::move(sem);
+ 
+-	*out_sync = sync;
++	*out_sync = sync.release();
++#ifdef _WIN32
++	// No fallible work remains: failed calls always retain the caller NT handle.
++	if (ext && ExternalHandle::semaphore_handle_type_imports_by_reference(ext.semaphore_handle_type))
++		::CloseHandle(ext.handle);
++#endif
+ 	return PYROWAVE_SUCCESS;
+ }
+ 
+@@ -557,7 +581,7 @@
+ pyrowave_result pyrowave_image_create(const pyrowave_image_create_info *info, pyrowave_image *out_image)
+ {
+ 	Util::set_thread_logging_interface(&null_logger);
+-	if (!info->device || !info->image_create_info)
++	if (!info || !out_image || !info->device || !info->image_create_info)
+ 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+ 
+ 	auto &device = info->device->device;
+@@ -581,6 +605,9 @@
+ 	image_create_info.misc = IMAGE_MISC_EXTERNAL_MEMORY_BIT | IMAGE_MISC_NO_DEFAULT_VIEWS_BIT;
+ 	image_create_info.external.handle = (decltype(image_create_info.external.handle))info->external_handle;
+ 	image_create_info.external.memory_handle_type = info->handle_type;
++#ifdef _WIN32
++	image_create_info.external.consume_win32_handle_on_import = false;
++#endif
+ 	image_create_info.pnext = const_cast<void *>(info->image_create_info->pNext);
+ 	image_create_info.layout = ImageLayout::General;
+ 	image_create_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+@@ -615,15 +642,25 @@
+ 		}
+ 	}
+ 
++	// Allocate before import so wrapper OOM cannot consume a caller handle.
++	std::unique_ptr<pyrowave_image_opaque> image(new (std::nothrow) pyrowave_image_opaque());
++	if (!image)
++		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
++
+ 	auto img = device.create_image(image_create_info);
+ 	if (!img)
+ 		return PYROWAVE_ERROR_FAILED_EXTERNAL_HANDLE;
+ 
+-	auto *image = new pyrowave_image_opaque();
+ 	image->device = &device;
+ 	image->img = std::move(img);
+ 
+-	*out_image = image;
++	*out_image = image.release();
++#ifdef _WIN32
++	// Commit ownership only after allocation, binding and wrapper creation succeed.
++	if (image_create_info.external &&
++	    ExternalHandle::memory_handle_type_imports_by_reference(image_create_info.external.memory_handle_type))
++		::CloseHandle(image_create_info.external.handle);
++#endif
+ 	return PYROWAVE_SUCCESS;
+ }
+ 
+diff --git a/pyrowave.h b/pyrowave.h
+--- a/pyrowave.h
++++ b/pyrowave.h
+@@ -71,6 +71,11 @@
+ // Used to dynamically detect any API/ABI incompatibility.
+ // This entry point is stable.
+ PYROWAVE_PUBLIC_API void pyrowave_get_api_version(uint32_t *major, uint32_t *minor, uint32_t *patch);
++
++// Local VibePollo extension, not part of the upstream API version.
++// Returns the pinned bitstream revision and success-only NT ownership contract.
++// The string is immutable, statically allocated, and valid while this library is loaded.
++PYROWAVE_PUBLIC_API const char *pyrowave_vibepollo_runtime_contract(void);
+ 
+ // Device API.
+ PYROWAVE_PUBLIC_API pyrowave_result pyrowave_create_default_device(pyrowave_device *device);
+@@ -226,7 +231,8 @@
+ 	// - OPAQUE_WIN32_BIT
+ 	// - OPAQUE_WIN32_KMT_BIT
+ 	// - D3D12_FENCE_BIT (D3D11_FENCE_BIT is alias of D3D12_FENCE_BIT)
+-	// NOTE: When importing NT handles, the implementation will take ownership and close the HANDLE on import.
++	// NOTE: NT HANDLE ownership transfers only when this create call returns PYROWAVE_SUCCESS.
++	// On failure the caller retains the HANDLE; on success the implementation closes it.
+ 	// The semaphore holds a reference to the underlying object.
+ 	// It may be a good idea to call DuplicateHandle() and hand that over to the implementation instead.
+ 	// This has been known to workaround some weird bugs in the wild, but the root cause is unknown.
+@@ -299,7 +305,8 @@
+ 	pyrowave_device device;
+ 
+ 	// Must be a valid external handle.
+-	// NOTE: When importing NT handles, the implementation will take ownership and close the HANDLE on import.
++	// NOTE: NT HANDLE ownership transfers only when this create call returns PYROWAVE_SUCCESS.
++	// On failure the caller retains the HANDLE; on success the implementation closes it.
+ 	// The image holds a reference to the underlying object.
+ 	// It may be a good idea to call DuplicateHandle() and hand that over to the implementation instead.
+ 	// This has been known to workaround some weird bugs in the wild, but the root cause is unknown.
+diff --git a/pyrowave-shared.def b/pyrowave-shared.def
+--- a/pyrowave-shared.def
++++ b/pyrowave-shared.def
+@@ -2,6 +2,7 @@
+ 
+ EXPORTS
+ 	pyrowave_get_api_version
++	pyrowave_vibepollo_runtime_contract
+ 	pyrowave_create_default_device
+ 	pyrowave_create_device_by_compat
+ 	pyrowave_create_device

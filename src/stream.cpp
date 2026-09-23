@@ -46,6 +46,8 @@ extern "C" {
 #include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
+#include "pyrowave_protocol.h"
+#include "pyrowave_transport.h"
 #include "rtsp.h"
 #include "session_history.h"
 #include "stream.h"
@@ -236,7 +238,7 @@ namespace stream {
   namespace {
     std::atomic_uint64_t g_paused_display_cleanup_generation {0};
 
-    void schedule_paused_display_cleanup(
+    [[maybe_unused]] void schedule_paused_display_cleanup(
       std::chrono::seconds timeout,
       std::string reason,
       bool enforce_display_restore,
@@ -332,6 +334,11 @@ namespace stream {
     std::uint32_t frameNumber;
     std::uint8_t tag[16];
   };
+
+  static_assert(sizeof(video_packet_raw_t) == 32);
+  static_assert(sizeof(video_packet_enc_prefix_t) == 32);
+  static_assert(sizeof(NV_VIDEO_PACKET) == 16);
+  static_assert(MAX_RTP_HEADER_SIZE == 16);
 
   struct audio_packet_t {
     RTP_PACKET rtp;
@@ -1072,19 +1079,46 @@ namespace stream {
       util::buffer_t<uint8_t *> shards_p;
 
       std::vector<platf::buffer_descriptor_t> payload_buffers;
+      // PyroWave's tested packetizer owns complete prepared shards. Legacy
+      // codecs keep using the existing zero-copy payload/parity buffers above.
+      std::shared_ptr<pyrowave::transport::encoded_block_t> pyrowave_owner;
 
       char *data(size_t el) {
         return (char *) shards_p[el];
       }
 
       char *prefix(size_t el) {
-        return prefixsize ? &headers[el * prefixsize] : nullptr;
+        return prefixsize ? header_data() + el * prefixsize : nullptr;
+      }
+
+      char *header_data() {
+        return pyrowave_owner ? reinterpret_cast<char *>(pyrowave_owner->prefixes.data()) : headers.begin();
       }
 
       size_t size() const {
         return nr_shards;
       }
     };
+
+    static fec_t encode_pyrowave(
+      std::string_view payload,
+      const pyrowave::protocol::fec_block_t &planned,
+      const pyrowave::protocol::transport_config_t &config,
+      const pyrowave::transport::block_info_t &info,
+      crypto::cipher::gcm_t *cipher,
+      std::uint64_t &iv_counter
+    ) {
+      auto encoded = pyrowave::transport::encode_block(
+        {reinterpret_cast<const std::uint8_t *>(payload.data()), payload.size()}, planned, config, info, cipher, iv_counter);
+      if (!encoded) throw std::runtime_error("PyroWave packetization/FEC/encryption failed");
+      auto owner = std::make_shared<pyrowave::transport::encoded_block_t>(std::move(*encoded));
+      util::buffer_t<std::uint8_t *> pointers {owner->size()};
+      for (std::size_t i = 0; i < owner->size(); ++i) pointers[i] = owner->shards.data() + i * owner->shard_bytes;
+      std::vector<platf::buffer_descriptor_t> buffers;
+      buffers.emplace_back(reinterpret_cast<const char *>(owner->shards.data()), owner->shards.size());
+      return {owner->data_shards, owner->size(), owner->percentage, owner->shard_bytes, owner->prefix_bytes,
+              {}, {}, std::move(pointers), std::move(buffers), std::move(owner)};
+    }
 
     static fec_t encode(const std::string_view &payload, size_t blocksize, size_t fecpercentage, size_t minparityshards, size_t prefixsize) {
       auto payload_size = payload.size();
@@ -1161,6 +1195,7 @@ namespace stream {
         util::buffer_t<char> {nr_shards * prefixsize},
         std::move(shards_p),
         std::move(payload_buffers),
+        {},
       };
     }
   }  // namespace fec
@@ -1635,7 +1670,13 @@ namespace stream {
     constexpr auto pending_peer_termination_grace = std::chrono::seconds(1);
     std::optional<std::chrono::steady_clock::time_point> process_terminated_since;
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
+#ifdef SUNSHINE_PYROWAVE_RTSP_HARNESS
+      // The component harness does not launch a user application. Session
+      // stop/capture/transport remain real and are controlled by its deadline.
+      constexpr bool process_running = true;
+#else
       const bool process_running = proc::proc.running() != 0;
+#endif
       bool has_session_awaiting_peer = false;
 
       {
@@ -1726,7 +1767,7 @@ namespace stream {
         })
       }
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(SUNSHINE_PYROWAVE_RTSP_HARNESS)
       if (session::running_sessions.load(std::memory_order_relaxed) > 0) {
         (void) display_helper_integration::apply_pending_if_ready();
         (void) apply_deferred_stream_start_actions_if_ready();
@@ -1932,11 +1973,35 @@ namespace stream {
       std::string_view payload {(char *) packet->data(), packet->data_size()};
       std::vector<uint8_t> payload_with_replacements;
 
+      auto fecPercentage = config::stream.fec_percentage;
+      std::optional<pyrowave::protocol::transport_plan_t> pyrowave_plan;
+      std::optional<pyrowave::protocol::transport_config_t> pyrowave_transport;
+      if (session->config.monitor.videoFormat == video::codec_wire_value(video::codec_e::pyrowave)) {
+        fecPercentage = session->config.monitor.pyrowave_fec_percentage;
+        const pyrowave::protocol::transport_config_t transport {
+          .packet_size = static_cast<std::uint32_t>(session->config.packetsize),
+          .path_mtu = session->config.monitor.pyrowave_path_mtu,
+          .ip_header_size = session->video.peer.address().is_v6() ? 40u : 20u,
+          .fec_percentage = static_cast<std::uint32_t>(fecPercentage),
+          .min_fec_packets = static_cast<std::uint32_t>(session->config.minRequiredFecPackets),
+          .encrypted = static_cast<bool>(session->video.cipher),
+        };
+        if (session->config.monitor.pyrowave_protocol_version == pyrowave::protocol::version &&
+            payload.size() <= session->config.monitor.pyrowave_frame_budget) {
+          pyrowave_plan = pyrowave::protocol::plan_transport(payload.size(), transport);
+        }
+        if (!pyrowave_plan || pyrowave_plan->wire_bytes > session->config.monitor.pyrowave_wire_byte_budget) {
+          BOOST_LOG(error) << "PyroWave: dropping frame outside negotiated transport budget";
+          continue;
+        }
+        pyrowave_transport = transport;
+      }
+
       // Apply replacements on the packet payload before performing any other operations.
       // We need to know the final frame size to calculate the last packet size, and we
       // must avoid matching replacements against the frame header or any other non-video
       // part of the payload.
-      if (packet->is_idr() && packet->replacements) {
+      if (!pyrowave_plan && packet->is_idr() && packet->replacements) {
         for (auto &replacement : *packet->replacements) {
           auto frame_old = replacement.old;
           auto frame_new = replacement._new;
@@ -1972,12 +2037,22 @@ namespace stream {
         session->stats.last_encode_latency_us10.store(0, std::memory_order_relaxed);
       }
 
-      auto fecPercentage = config::stream.fec_percentage;
-
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
       auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
-      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+      std::vector<std::uint8_t> payload_new;
+      if (pyrowave_transport) {
+        auto prepared = pyrowave::transport::packetize_frame(
+          {reinterpret_cast<const std::uint8_t *>(payload.data()), payload.size()}, *pyrowave_transport,
+          frame_header.frame_processing_latency);
+        if (!prepared) {
+          BOOST_LOG(error) << "PyroWave: invalid frame envelope rejected before transport";
+          continue;
+        }
+        payload_new = std::move(*prepared);
+      } else {
+        payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+      }
 
       payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
 
@@ -2000,7 +2075,9 @@ namespace stream {
 
       // If the number of FEC blocks needed exceeds the protocol limit, turn off FEC for this frame.
       // For normal FEC percentages, this should only happen for enormous frames (over 800 packets at 20%).
-      if (fec_blocks_needed > MAX_FEC_BLOCKS) {
+      if (pyrowave_plan) {
+        fec_blocks_needed = pyrowave_plan->block_count;
+      } else if (fec_blocks_needed > MAX_FEC_BLOCKS) {
         BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame (needed "sv << fec_blocks_needed << " FEC blocks)"sv;
         fecPercentage = 0;
         fec_blocks_needed = MAX_FEC_BLOCKS;
@@ -2025,7 +2102,16 @@ namespace stream {
 
       // Split the data into aligned FEC blocks
       for (int x = 0; x < fec_blocks_needed; ++x) {
-        if (x == fec_blocks_needed - 1) {
+        if (pyrowave_plan) {
+          // Use precisely the balanced shard layout used to budget this frame.
+          // The legacy rounded byte split can have a different FEC overhead.
+          std::size_t offset = 0;
+          for (int previous = 0; previous < x; ++previous) {
+            offset += pyrowave_plan->blocks[previous].data_shards * blocksize;
+          }
+          const auto block_bytes = pyrowave_plan->blocks[x].data_shards * blocksize;
+          fec_blocks[x] = payload.substr(offset, std::min<std::size_t>(block_bytes, payload.size() - offset));
+        } else if (x == fec_blocks_needed - 1) {
           // The last block must extend to the end of the payload
           fec_blocks[x] = payload.substr(x * aligned_size);
         } else {
@@ -2092,7 +2178,7 @@ namespace stream {
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
           auto packets = (current_payload.size() + (blocksize - 1)) / blocksize;
 
-          for (int x = 0; x < packets; ++x) {
+          for (int x = 0; !pyrowave_plan && x < packets; ++x) {
             auto *inspect = (video_packet_raw_t *) &current_payload[x * blocksize];
 
             inspect->packet.frameIndex = (uint32_t) packet->frame_index();
@@ -2113,12 +2199,23 @@ namespace stream {
 
           frame_fec_latency_logger.first_point_now();
           // If video encryption is enabled, we allocate space for the encryption header before each shard
-          auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
+          auto shards = [&]() {
+            if (pyrowave_plan) {
+              using rtp_tick = std::chrono::duration<uint32_t, std::ratio<1, 90000>>;
+              const auto timestamp = std::chrono::round<rtp_tick>(packet->frame_timestamp.value_or(ratecontrol_next_frame_start) - video_epoch).count();
+              return fec::encode_pyrowave(current_payload, pyrowave_plan->blocks[blockIndex], *pyrowave_transport,
+                                          {static_cast<std::uint32_t>(packet->frame_index()), static_cast<std::uint32_t>(lowseq), timestamp,
+                                           static_cast<std::uint32_t>(blockIndex), pyrowave_plan->block_count},
+                                          session->video.cipher ? &*session->video.cipher : nullptr, session->video.gcm_iv_counter);
+            }
+            return fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets,
+                               session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
+          }();
           frame_fec_latency_logger.second_point_now_and_log();
 
           auto peer_address = session->video.peer.address();
           auto batch_info = platf::batched_send_info_t {
-            shards.headers.begin(),
+            shards.header_data(),
             shards.prefixsize,
             shards.payload_buffers,
             shards.blocksize,
@@ -2145,39 +2242,41 @@ namespace stream {
 
           // set FEC info now that we know for sure what our percentage will be for this frame
           for (auto x = 0; x < shards.size(); ++x) {
-            auto *inspect = (video_packet_raw_t *) shards.data(x);
+            if (!pyrowave_plan) {
+              auto *inspect = (video_packet_raw_t *) shards.data(x);
 
-            inspect->packet.fecInfo =
-              (uint32_t) (x << 12 |
-                          shards.data_shards << 22 |
-                          shards.percentage << 4);
+              inspect->packet.fecInfo =
+                (uint32_t) (x << 12 |
+                            shards.data_shards << 22 |
+                            shards.percentage << 4);
 
-            inspect->rtp.header = 0x80 | FLAG_EXTENSION;
-            inspect->rtp.sequenceNumber = util::endian::big<uint16_t>(lowseq + x);
-            inspect->rtp.timestamp = util::endian::big<uint32_t>(timestamp);
+              inspect->rtp.header = 0x80 | FLAG_EXTENSION;
+              inspect->rtp.sequenceNumber = util::endian::big<uint16_t>(lowseq + x);
+              inspect->rtp.timestamp = util::endian::big<uint32_t>(timestamp);
 
-            inspect->packet.multiFecBlocks = (blockIndex << 4) | ((fec_blocks_needed - 1) << 6);
-            inspect->packet.frameIndex = (uint32_t) packet->frame_index();
+              inspect->packet.multiFecBlocks = (blockIndex << 4) | ((fec_blocks_needed - 1) << 6);
+              inspect->packet.frameIndex = (uint32_t) packet->frame_index();
 
-            // Encrypt this shard if video encryption is enabled
-            if (session->video.cipher) {
-              // We use the deterministic IV construction algorithm specified in NIST SP 800-38D
-              // Section 8.2.1. The sequence number is our "invocation" field and the 'V' in the
-              // high bytes is the "fixed" field. Because each client provides their own unique
-              // key, our values in the fixed field need only uniquely identify each independent
-              // use of the client's key with AES-GCM in our code.
-              //
-              // The IV counter is 64 bits long which allows for 2^64 encrypted video packets
-              // to be sent to each client before the IV repeats.
-              std::copy_n((uint8_t *) &session->video.gcm_iv_counter, sizeof(session->video.gcm_iv_counter), std::begin(iv));
-              iv[11] = 'V';  // Video stream
-              session->video.gcm_iv_counter++;
+              // Encrypt this shard if video encryption is enabled
+              if (session->video.cipher) {
+                // We use the deterministic IV construction algorithm specified in NIST SP 800-38D
+                // Section 8.2.1. The sequence number is our "invocation" field and the 'V' in the
+                // high bytes is the "fixed" field. Because each client provides their own unique
+                // key, our values in the fixed field need only uniquely identify each independent
+                // use of the client's key with AES-GCM in our code.
+                //
+                // The IV counter is 64 bits long which allows for 2^64 encrypted video packets
+                // to be sent to each client before the IV repeats.
+                std::copy_n((uint8_t *) &session->video.gcm_iv_counter, sizeof(session->video.gcm_iv_counter), std::begin(iv));
+                iv[11] = 'V';  // Video stream
+                session->video.gcm_iv_counter++;
 
-              // Encrypt the target buffer in place
-              auto *prefix = (video_packet_enc_prefix_t *) shards.prefix(x);
-              prefix->frameNumber = (std::uint32_t) packet->frame_index();
-              std::copy(std::begin(iv), std::end(iv), prefix->iv);
-              session->video.cipher->encrypt(std::string_view {(char *) inspect, (size_t) blocksize}, prefix->tag, (uint8_t *) inspect, &iv);
+                // Encrypt the target buffer in place
+                auto *prefix = (video_packet_enc_prefix_t *) shards.prefix(x);
+                prefix->frameNumber = (std::uint32_t) packet->frame_index();
+                std::copy(std::begin(iv), std::end(iv), prefix->iv);
+                session->video.cipher->encrypt(std::string_view {(char *) inspect, (size_t) blocksize}, prefix->tag, (uint8_t *) inspect, &iv);
+              }
             }
 
             if (x - next_shard_to_send + 1 >= send_batch_size ||
@@ -2698,7 +2797,11 @@ namespace stream {
         return;
       }
 
+#ifndef SUNSHINE_PYROWAVE_RTSP_HARNESS
+      // The standalone RTSP component harness preserves session ownership and
+      // threads while isolating desktop, driver-profile and platform callbacks.
       platf::streaming_will_start();
+#endif
       shared_platform_started = true;
     }
 
@@ -2720,6 +2823,7 @@ namespace stream {
       }
 
       config::set_runtime_output_name_override(std::nullopt);
+#ifndef SUNSHINE_PYROWAVE_RTSP_HARNESS
 #ifdef _WIN32
       display_helper_integration::clear_pending_apply();
       clear_deferred_stream_start_actions();
@@ -2793,9 +2897,12 @@ namespace stream {
         (void) display_helper_integration::revert();
       }
 #endif
+#endif
 
       if (shared_platform_started) {
+#ifndef SUNSHINE_PYROWAVE_RTSP_HARNESS
         platf::streaming_will_stop();
+#endif
         shared_platform_started = false;
       }
 
@@ -2973,11 +3080,13 @@ namespace stream {
           webrtc_stream::has_active_or_pending_sessions() ||
           webrtc_stream::has_teardown_in_progress();
         if (!rtsp_pending && !webrtc_active) {
+#ifndef SUNSHINE_PYROWAVE_RTSP_HARNESS
           proc::proc.pause(true);
+#endif
         }
         const bool is_paused = proc::proc.current_app_id() > 0;
         if (is_paused) {
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1 && !defined(SUNSHINE_PYROWAVE_RTSP_HARNESS)
           system_tray::update_tray_pausing(proc::proc.get_last_run_app_name());
 #endif
         }
@@ -2989,12 +3098,14 @@ namespace stream {
           .apply_deferred_config = false,
           .virtual_display_guid_bytes = session.virtual_display.guid_bytes,
         };
+#ifndef SUNSHINE_PYROWAVE_RTSP_HARNESS
         const bool shared_runtime_still_owned =
           session::has_shared_runtime_owner(finalize_context);
         platf::frame_limiter_streaming_stop(
           platf::frame_limiter_owner::rtsp,
           is_paused || shared_runtime_still_owned
         );
+#endif
 #else
         const session::shared_runtime_finalize_context_t finalize_context {
           .ignore_current_rtsp_teardown = true,
@@ -3105,7 +3216,7 @@ namespace stream {
           webrtc_stream::set_rtsp_capture_config(session.config.monitor, session.config.audio);
         }
         webrtc_stream::set_rtsp_sessions_active(true);
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(SUNSHINE_PYROWAVE_RTSP_HARNESS)
         if (!session.config.monitor.input_only) {
           // Apply RTSS frame limit if enabled (Windows-only)
           std::optional<int> lossless_rtss_limit;
@@ -3157,7 +3268,9 @@ namespace stream {
 #else
         session::start_shared_platform_if_needed();
 #endif
+#ifndef SUNSHINE_PYROWAVE_RTSP_HARNESS
         proc::proc.resume();
+#endif
       }
 
       if (!session.do_cmds.empty()) {
@@ -3179,7 +3292,7 @@ namespace stream {
         exec_thread.detach();
       }
 
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1 && !defined(SUNSHINE_PYROWAVE_RTSP_HARNESS)
       system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
       update::on_stream_started();
   #if defined(_WIN32)

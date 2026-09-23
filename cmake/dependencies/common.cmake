@@ -61,6 +61,8 @@ endif()
 include("${CMAKE_MODULE_PATH}/dependencies/FindOpus.cmake")
 
 # platform specific dependencies
+include("${CMAKE_MODULE_PATH}/dependencies/pyrowave.cmake")
+
 if(WIN32)
     include("${CMAKE_MODULE_PATH}/dependencies/windows.cmake")
 elseif(UNIX)

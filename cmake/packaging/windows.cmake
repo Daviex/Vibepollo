@@ -3,6 +3,15 @@ include("${CMAKE_SOURCE_DIR}/cmake/packaging/windows_virtual_display_contract.cm
 
 install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
 
+if(SUNSHINE_ENABLE_PYROWAVE)
+    # Package the same adjacent DLL used when running from the build directory.
+    # Release stripping/signing operates there and deliberately excludes _deps.
+    install(FILES "$<TARGET_FILE_DIR:sunshine>/${SUNSHINE_PYROWAVE_RUNTIME_NAME}"
+        DESTINATION "." COMPONENT application)
+    install(DIRECTORY "${SUNSHINE_PYROWAVE_STAGE_DIR}/licenses/"
+        DESTINATION "licenses/pyrowave" COMPONENT application)
+endif()
+
 # Hardening: include zlib1.dll (loaded via LoadLibrary() in openssl's libcrypto.a)
 # Check for zlib in Sunshine or Apollo install directories
 if(EXISTS "${ZLIB}")

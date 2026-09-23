@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 // lib includes
 #include <boost/core/noncopyable.hpp>
@@ -475,6 +476,15 @@ namespace platf {
     nvenc::nvenc_base *nvenc = nullptr;
   };
 
+  struct pyrowave_encode_device_t: encode_device_t {
+    virtual bool init_encoder(const video::config_t &client_config, const video::sunshine_colorspace_t &colorspace) = 0;
+    virtual std::string error_reason() const { return {}; }
+
+    // One complete frame as native upstream packets, before transport framing.
+    // Calls are serialized on the session's encode worker.
+    virtual std::optional<std::vector<std::vector<std::uint8_t>>> encode_frame(std::uint64_t frame_index, std::size_t target_bytes) = 0;
+  };
+
   struct amf_encode_device_t: encode_device_t {
     // Native backends prepare only non-driver state on the capture thread.
     // D3D/AMF construction is invoked by the bounded initialization worker.
@@ -571,6 +581,10 @@ namespace platf {
     }
 
     virtual std::unique_ptr<nvenc_encode_device_t> make_nvenc_encode_device(pix_fmt_e pix_fmt) {
+      return nullptr;
+    }
+
+    virtual std::unique_ptr<pyrowave_encode_device_t> make_pyrowave_encode_device() {
       return nullptr;
     }
 

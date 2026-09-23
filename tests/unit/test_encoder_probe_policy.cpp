@@ -40,6 +40,25 @@ TEST(EncoderProbePolicy, DifferentObservedAdapterMisses) {
   EXPECT_FALSE(cache_key_matches(key("luid=nvidia"), cached_key));
 }
 
+TEST(EncoderProbePolicy, StandardAndPyroWaveProbeResultsCannotAlias) {
+  const auto standard_key = key("luid=nvidia");
+  auto pyrowave_key = standard_key;
+  pyrowave_key.kind = video::encoder_probe_policy::probe_kind_e::pyrowave;
+
+  EXPECT_FALSE(cache_key_matches(pyrowave_key, standard_key));
+  EXPECT_FALSE(cache_key_matches(standard_key, pyrowave_key));
+  const auto owned_key = own_successful_cache_key(
+    pyrowave_key,
+    probe_observation_t {
+      .required_adapter = "luid=nvidia",
+      .observed_adapter = "luid=nvidia",
+    }
+  );
+  ASSERT_TRUE(owned_key);
+  EXPECT_EQ(owned_key->kind, video::encoder_probe_policy::probe_kind_e::pyrowave);
+  EXPECT_TRUE(cache_key_matches(pyrowave_key, owned_key));
+}
+
 TEST(EncoderProbePolicy, PendingHintCannotOwnMismatchedObservedProbe) {
   const auto pending_key = key("luid=nvidia");
   const auto owned_key = own_successful_cache_key(

@@ -66,6 +66,7 @@
 #include "stream.h"
 #include "system_tray.h"
 #include "video.h"
+#include "pyrowave_protocol.h"
 #include "webrtc_stream.h"
 #include "zwpad.h"
 
@@ -1831,6 +1832,7 @@ namespace nvhttp {
       const resolved_client_identity_t *resolved_client_identity
     ) {
       auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
+      launch_session->pyrowave_requested = get_arg(args, "pyrowave", "0") == "1";
 
       launch_session->id = ++session_id_counter;
       launch_session->appid = 0;
@@ -2896,6 +2898,23 @@ namespace nvhttp {
       }
       tree.put("root.ServerCodecModeSupport", codec_mode_flags);
 
+      // Private capability is visible only to a paired HTTPS client that opts
+      // into this extension. It never borrows a standard codec capability bit.
+      if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+        const auto extension_args = request->parse_query_string();
+        const auto opt_in = extension_args.find("pyrowave");
+        if (pair_status && opt_in != extension_args.end() && opt_in->second == "1") {
+          auto config_gate = config::acquire_apply_read_gate();
+          const auto capability = video::probe_pyrowave();
+          if (capability.available) {
+            tree.put("root.PyroWaveSupport", 1);
+            tree.put("root.PyroWaveProtocolVersion", pyrowave::protocol::version);
+            tree.put("root.PyroWaveBitstreamRevision", std::string(pyrowave::protocol::bitstream_revision));
+            tree.put("root.PyroWaveProfile", std::string(pyrowave::protocol::profile));
+          }
+        }
+      }
+
       tree.put("root.PairStatus", pair_status);
 
       if constexpr (std::is_same_v<SunshineHTTPS, T>) {
@@ -3166,6 +3185,14 @@ namespace nvhttp {
       auto args = request->parse_query_string();
 
       auto appid_str = get_arg(args, "appid", "0");
+      const auto requested_pyrowave = get_arg(args, "pyrowave", "0");
+      if (requested_pyrowave != "0" &&
+          (requested_pyrowave != "1" || !config::video.pyrowave_enabled || get_arg(args, "hdrMode", "0") != "0")) {
+        tree.put("root.gamesession", 0);
+        tree.put("root.<xmlattr>.status_code", 406);
+        tree.put("root.<xmlattr>.status_message", "PyroWave requires an enabled host and an SDR launch");
+        return;
+      }
       auto appuuid_str = get_arg(args, "appuuid", "");
       auto requested_app = proc::proc.resolve_app(appid_str, appuuid_str);
       auto appid = requested_app ? util::from_view(requested_app->id) : util::from_view(appid_str);
@@ -3366,6 +3393,12 @@ namespace nvhttp {
 #endif
       const bool allow_display_changes = true;
       auto launch_session = make_launch_session_from_snapshot(host_audio, is_input_only, args, verified_client, &request_client_identity);
+      if (launch_session->pyrowave_requested && (is_input_only || rtsp_stream::effective_hdr_requested(*launch_session))) {
+        tree.put("root.<xmlattr>.status_code", 406);
+        tree.put("root.<xmlattr>.status_message", "PyroWave requires an SDR video session; the host HDR policy is incompatible.");
+        tree.put("root.gamesession", 0);
+        return;
+      }
       std::optional<std::string> pending_output_override;
       auto output_override_guard = util::fail_guard([&]() {
         if (pending_output_override) {
@@ -3495,9 +3528,15 @@ namespace nvhttp {
         // or any number of other factors).
 
 #ifdef _WIN32
+      std::string pyrowave_probe_failure;
       bool encoder_probe_failed = false;
       bool probe_display_unavailable = false;
-      if (!video::has_successful_encoder_probe()) {
+      if (launch_session->pyrowave_requested) {
+        wait_for_probe_helper_settle(launch_session, display_startup_deadline);
+        const auto probe = video::probe_pyrowave(true);
+        encoder_probe_failed = !probe.available;
+        pyrowave_probe_failure = probe.reason;
+      } else if (!video::has_successful_encoder_probe()) {
         {
           VDISPLAY::ensure_display_result ensure_result {};
           auto cleanup_probe_display = util::fail_guard([&ensure_result]() {
@@ -3522,11 +3561,13 @@ namespace nvhttp {
         BOOST_LOG(debug) << "Launch encoder probe skipped (matching selected-GPU cache).";
       }
 #else
-      bool encoder_probe_failed = video::probe_encoders();
+      const auto pyrowave_probe = launch_session->pyrowave_requested ? video::probe_pyrowave(true) : video::pyrowave_probe_result_t {};
+      const auto pyrowave_probe_failure = pyrowave_probe.reason;
+      bool encoder_probe_failed = launch_session->pyrowave_requested ? !pyrowave_probe.available : video::probe_encoders();
 #endif
 
       if (encoder_probe_failed && !is_input_only) {
-        const std::string status_message =
+        const std::string status_message = !pyrowave_probe_failure.empty() ? pyrowave_probe_failure :
 #ifdef _WIN32
           probe_display_unavailable ?
             "No usable display is available on the selected capture adapter." :
@@ -3721,6 +3762,15 @@ namespace nvhttp {
       return;
     }
 
+    const auto requested_pyrowave = get_arg(args, "pyrowave", "0");
+    if (requested_pyrowave != "0" &&
+        (requested_pyrowave != "1" || !config::video.pyrowave_enabled || get_arg(args, "hdrMode", "0") != "0")) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 406);
+      tree.put("root.<xmlattr>.status_message", "PyroWave requires an enabled host and an SDR resume");
+      return;
+    }
+
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
@@ -3817,6 +3867,12 @@ namespace nvhttp {
     }
 
     auto launch_session = make_launch_session_from_snapshot(host_audio, is_input_only, args, verified_client, &request_client_identity);
+    if (launch_session->pyrowave_requested && (is_input_only || rtsp_stream::effective_hdr_requested(*launch_session))) {
+      tree.put("root.<xmlattr>.status_code", 406);
+      tree.put("root.<xmlattr>.status_message", "PyroWave requires an SDR video session; the host HDR policy is incompatible.");
+      tree.put("root.resume", 0);
+      return;
+    }
     if (!proc::proc.allow_client_commands || !verified_client->allow_client_commands) {
       launch_session->client_do_cmds.clear();
       launch_session->client_undo_cmds.clear();
@@ -4029,9 +4085,15 @@ namespace nvhttp {
       // due to hotplugging, driver crash, primary monitor change,
       // or any number of other factors).
 #ifdef _WIN32
+      std::string pyrowave_probe_failure;
       bool encoder_probe_failed = false;
       bool probe_display_unavailable = false;
-      if (!video::has_successful_encoder_probe()) {
+      if (launch_session->pyrowave_requested) {
+        wait_for_probe_helper_settle(launch_session, display_startup_deadline);
+        const auto probe = video::probe_pyrowave(true);
+        encoder_probe_failed = !probe.available;
+        pyrowave_probe_failure = probe.reason;
+      } else if (!video::has_successful_encoder_probe()) {
         {
           VDISPLAY::ensure_display_result ensure_result {};
           auto cleanup_probe_display = util::fail_guard([&ensure_result]() {
@@ -4054,11 +4116,13 @@ namespace nvhttp {
         BOOST_LOG(debug) << "Resume encoder probe skipped (matching selected-GPU cache).";
       }
 #else
-      bool encoder_probe_failed = video::probe_encoders();
+      const auto pyrowave_probe = launch_session->pyrowave_requested ? video::probe_pyrowave(true) : video::pyrowave_probe_result_t {};
+      const auto pyrowave_probe_failure = pyrowave_probe.reason;
+      bool encoder_probe_failed = launch_session->pyrowave_requested ? !pyrowave_probe.available : video::probe_encoders();
 #endif
 
       if (encoder_probe_failed && !launch_session->input_only) {
-        const std::string status_message =
+        const std::string status_message = !pyrowave_probe_failure.empty() ? pyrowave_probe_failure :
 #ifdef _WIN32
           probe_display_unavailable ?
             "No usable display is available on the selected capture adapter." :

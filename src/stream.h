@@ -42,6 +42,8 @@ namespace stream {
         return "HEVC";
       case 2:
         return "AV1";
+      case 3:
+        return "PyroWave";
       default:
         return "Unknown";
     }
@@ -138,7 +140,7 @@ namespace stream {
     int fps;
     int encoder_bitrate_kbps;
     int requested_bitrate_kbps;  // Original client-requested wire bitrate (== encoder_bitrate_kbps for clients that don't send maximumBitrateKbps)
-    int video_format;  // 0=H.264, 1=HEVC, 2=AV1
+    int video_format;  // codec_e wire value: 0=H.264, 1=HEVC, 2=AV1, 3=PyroWave
     int dynamic_range;  // Encoder bit depth: 0=8-bit, 1=10-bit
     bool hdr;
     bool yuv444;

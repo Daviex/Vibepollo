@@ -13,10 +13,12 @@ extern "C" {
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <format>
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,6 +39,7 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#include "pyrowave_negotiation.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -52,8 +55,14 @@ using namespace std::literals;
 
 #ifdef _WIN32
 namespace {
+#ifdef SUNSHINE_PYROWAVE_RTSP_HARNESS
+  // The standalone RTSP harness must never reset a running server's HDR events.
+  constexpr wchar_t kVulkanHdrLayerGlobalActiveEventName[] = L"Global\\PyroWaveRtspHarnessHdrActive";
+  constexpr wchar_t kVulkanHdrLayerLocalActiveEventName[] = L"Local\\PyroWaveRtspHarnessHdrActive";
+#else
   constexpr wchar_t kVulkanHdrLayerGlobalActiveEventName[] = L"Global\\SunshineVirtualHdrActive";
   constexpr wchar_t kVulkanHdrLayerLocalActiveEventName[] = L"Local\\SunshineVirtualHdrActive";
+#endif
 
   std::mutex g_vulkan_hdr_layer_event_mutex;
   HANDLE g_vulkan_hdr_layer_global_event = nullptr;
@@ -178,48 +187,6 @@ namespace rtsp_stream {
 
   bool activates_vulkan_hdr_layer_for_stream(const video::config_t &config) {
     return config.dynamicRange != 0 && !config.prefer_sdr_10bit && !config.force_sdr;
-  }
-
-  std::shared_ptr<launch_session_t> launch_session_t::clone_for_startup() const {
-    auto snapshot = std::make_shared<launch_session_t>();
-
-    snapshot->id = id;
-    snapshot->gcm_key = gcm_key;
-    snapshot->iv = iv;
-    snapshot->av_ping_payload = av_ping_payload;
-    snapshot->control_connect_data = control_connect_data;
-    snapshot->unique_id = unique_id;
-    snapshot->client_uuid = client_uuid;
-    snapshot->device_name = device_name;
-    snapshot->client_display_mode_override = client_display_mode_override;
-    snapshot->client_display_refresh_millihz = client_display_refresh_millihz;
-    snapshot->enable_hdr = enable_hdr;
-    snapshot->prefer_sdr_10bit = prefer_sdr_10bit;
-    snapshot->force_sdr = force_sdr;
-    snapshot->client_vrr_requested = client_vrr_requested;
-    snapshot->perm = perm;
-    snapshot->fps = fps;
-    // Copied, not moved: the io_context thread still owns the original session.
-    // stream::session::alloc() moves these out of the clone on the startup worker.
-    snapshot->client_do_cmds = client_do_cmds;
-    snapshot->client_undo_cmds = client_undo_cmds;
-    snapshot->virtual_display = virtual_display;
-    snapshot->virtual_display_guid_bytes = virtual_display_guid_bytes;
-    snapshot->gen1_framegen_fix = gen1_framegen_fix;
-    snapshot->gen2_framegen_fix = gen2_framegen_fix;
-    snapshot->frame_generation_enabled = frame_generation_enabled;
-    snapshot->lossless_scaling_framegen = lossless_scaling_framegen;
-    snapshot->framegen_refresh_rate = framegen_refresh_rate;
-    snapshot->framegen_refresh_millihz = framegen_refresh_millihz;
-    snapshot->framegen_refresh_multiplier = framegen_refresh_multiplier;
-    snapshot->frame_generation_provider = frame_generation_provider;
-    snapshot->lossless_scaling_target_fps = lossless_scaling_target_fps;
-    snapshot->lossless_scaling_rtss_limit = lossless_scaling_rtss_limit;
-#ifdef _WIN32
-    snapshot->display_helper_gate = display_helper_gate;
-#endif
-
-    return snapshot;
   }
 
   class socket_t: public std::enable_shared_from_this<socket_t> {
@@ -1577,10 +1544,14 @@ namespace rtsp_stream {
           begin = pos;
         }
       }
+      if (begin != pos) {
+        lines.emplace_back(begin, pos - begin);
+      }
     }
 
     std::string_view client;
     std::unordered_map<std::string_view, std::string_view> args;
+    bool conflicting_arguments = false;
 
     for (auto line : lines) {
       auto type = line.substr(0, 2);
@@ -1588,14 +1559,23 @@ namespace rtsp_stream {
         client = line.substr(2);
       } else if (type == "a=") {
         auto pos = line.find(':');
+        if (pos == std::string_view::npos || pos <= 2) {
+          continue;
+        }
 
         auto name = line.substr(2, pos - 2);
         auto val = line.substr(pos + 1);
 
-        if (val[val.size() - 1] == ' ') {
+        if (!val.empty() && val.back() == ' ') {
           val = val.substr(0, val.size() - 1);
         }
-        args.emplace(name, val);
+        const auto [existing, inserted] = args.emplace(name, val);
+        conflicting_arguments |= !inserted && existing->second != val;
+        if (!inserted && existing->second != val &&
+            (name.starts_with("x-vp-pyrowave.") || name == "x-nv-vqos[0].bitStreamFormat")) {
+          respond(socket->sock, *session, &option, 400, "Conflicting codec parameters", req->sequenceNumber, {});
+          return false;
+        }
       }
     }
 
@@ -1615,6 +1595,69 @@ namespace rtsp_stream {
     args.try_emplace("x-ss-video[0].chromaSamplingType"sv, "0"sv);
     args.try_emplace("x-ss-video[0].intraRefresh"sv, "0"sv);
     args.try_emplace("x-nv-video[0].clientRefreshRateX100"sv, "0"sv);
+
+    const auto requested_codec = video::parse_wire_codec(args.at("x-nv-vqos[0].bitStreamFormat"sv));
+    if (!requested_codec) {
+      BOOST_LOG(warning) << "Rejecting unknown or malformed video codec identifier";
+      respond(socket->sock, *session, &option, 400, "Unsupported video codec", req->sequenceNumber, {});
+      return false;
+    }
+    const bool is_pyrowave = *requested_codec == video::codec_e::pyrowave;
+    if (is_pyrowave && conflicting_arguments) {
+      respond(socket->sock, *session, &option, 400, "Conflicting PyroWave parameters", req->sequenceNumber, {});
+      return false;
+    }
+    if (is_pyrowave != session->pyrowave_requested) {
+      respond(socket->sock, *session, &option, 406, "Codec does not match launch request", req->sequenceNumber, {});
+      return false;
+    }
+    std::uint32_t pyrowave_path_mtu = 0;
+    if (is_pyrowave) {
+#ifndef SUNSHINE_ENABLE_PYROWAVE
+      respond(socket->sock, *session, &option, 406, "PyroWave unavailable in this build", req->sequenceNumber, {});
+      return false;
+#else
+      // Validate original numeric fields before legacy normalization/coercion.
+      // GPU work is deferred to the startup worker below, never the RTSP loop.
+      for (const auto key : {"x-vp-pyrowave.pathMtu"sv, "x-nv-video[0].clientViewportHt"sv,
+                            "x-nv-video[0].clientViewportWd"sv, "x-nv-video[0].maxFPS"sv,
+                            "x-nv-video[0].clientRefreshRateX100"sv, "x-nv-video[0].packetSize"sv,
+                            "x-nv-video[0].encoderCscMode"sv, "x-nv-video[0].dynamicRangeMode"sv,
+                            "x-ss-video[0].chromaSamplingType"sv, "x-nv-vqos[0].bw.maximumBitrateKbps"sv,
+                            "x-ml-video.configuredBitrateKbps"sv, "x-nv-vqos[0].fec.minRequiredFecPackets"sv,
+                            "x-nv-audio.surround.numChannels"sv, "x-ss-general.encryptionEnabled"sv,
+                            "x-nv-general.featureFlags"sv}) {
+        const auto field = args.find(key);
+        int value = 0;
+        bool valid = field != args.end() && !field->second.empty() &&
+                     field->second.front() >= '0' && field->second.front() <= '9';
+        if (valid) {
+          const auto text = field->second;
+          const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+          valid = error == std::errc {} && end == text.data() + text.size();
+        }
+        if (!valid) {
+          respond(socket->sock, *session, &option, 400, "Invalid PyroWave numeric parameter", req->sequenceNumber, {});
+          return false;
+        }
+        if (key == "x-vp-pyrowave.pathMtu") {
+          pyrowave_path_mtu = static_cast<std::uint32_t>(value);
+        }
+        if ((key == "x-nv-video[0].maxFPS" && (value < 1 || value > 240)) ||
+            (key == "x-ss-general.encryptionEnabled" && value > 7) ||
+            ((key == "x-nv-vqos[0].bw.maximumBitrateKbps" || key == "x-ml-video.configuredBitrateKbps") && value > 800000) ||
+            (key == "x-nv-audio.surround.numChannels" && (value < 1 || value > 8)) ||
+            (key == "x-nv-video[0].packetSize" && config::stream.packetsize >= config::PACKETSIZE_MIN &&
+             config::stream.packetsize <= config::PACKETSIZE_MAX && value > config::stream.packetsize) ||
+            (key == "x-nv-video[0].dynamicRangeMode" && value != 0) ||
+            (key == "x-ss-video[0].chromaSamplingType" && value != 0) ||
+            (key == "x-nv-video[0].encoderCscMode" && value != 3)) {
+          respond(socket->sock, *session, &option, 406, "Unsupported PyroWave profile", req->sequenceNumber, {});
+          return false;
+        }
+      }
+#endif
+    }
 
     stream::config_t config {};
     config.gen1_framegen_fix = false;
@@ -1671,7 +1714,7 @@ namespace rtsp_stream {
       config.monitor.slicesPerFrame = (int) util::from_view(args.at("x-nv-video[0].videoEncoderSlicesPerFrame"sv));
       config.monitor.numRefFrames = (int) util::from_view(args.at("x-nv-video[0].maxNumReferenceFrames"sv));
       config.monitor.encoderCscMode = (int) util::from_view(args.at("x-nv-video[0].encoderCscMode"sv));
-      config.monitor.videoFormat = (int) util::from_view(args.at("x-nv-vqos[0].bitStreamFormat"sv));
+      config.monitor.videoFormat = video::codec_wire_value(*requested_codec);
       config.monitor.dynamicRange = (int) util::from_view(args.at("x-nv-video[0].dynamicRangeMode"sv));
       config.monitor.chromaSamplingType = (int) util::from_view(args.at("x-ss-video[0].chromaSamplingType"sv));
       config.monitor.enableIntraRefresh = (int) util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
@@ -1699,7 +1742,7 @@ namespace rtsp_stream {
       // Some clients send a stale or incorrect clientRefreshRateX100 (e.g. 6000 = 60fps)
       // while requesting a higher maxFPS (e.g. 120). Since framerateX100 unconditionally
       // overrides capture pacing, an inconsistent value caps the stream to the wrong fps.
-      if (config.monitor.framerateX100 > 0 && config.monitor.framerate > 0) {
+      if (!is_pyrowave && config.monitor.framerateX100 > 0 && config.monitor.framerate > 0) {
         int fps_from_x100 = (int) std::lround(config.monitor.framerateX100 / 100.0);
         if (fps_from_x100 != config.monitor.framerate) {
           BOOST_LOG(warning) << "clientRefreshRateX100 ("
@@ -1727,8 +1770,8 @@ namespace rtsp_stream {
       BOOST_LOG(info) << "Host Streaming bitrate is [" << configuredBitrateKbps << "kbps]";
 
       // Hack: Restore bitrate for warp mode
-      size_t warp_factor = std::round((float) config.monitor.framerate * 1000 / session->fps);
-      if (config::video.limit_framerate && warp_factor >= 2) {
+      size_t warp_factor = is_pyrowave ? 1 : std::round((float) config.monitor.framerate * 1000 / session->fps);
+      if (!is_pyrowave && config::video.limit_framerate && warp_factor >= 2) {
         configuredBitrateKbps *= warp_factor;
         BOOST_LOG(info) << "Warp factor [" << warp_factor << "] engaged";
       }
@@ -1783,28 +1826,34 @@ namespace rtsp_stream {
       BOOST_LOG(info) << "Client requested VRR low-latency stream policy";
     }
 
-    const bool prefer_10bit_sdr = effective_10bit_sdr_requested(*session);
-    const bool hevc_main10 = config.monitor.videoFormat == 1 && video::active_hevc_mode >= 3;
-    const bool av1_main10 = config.monitor.videoFormat == 2 && video::active_av1_mode >= 3;
-    const bool supports_10bit_dynamic_range = hevc_main10 || av1_main10;
-    config.monitor.force_sdr = session->force_sdr;
-    if (prefer_10bit_sdr) {
-      if (supports_10bit_dynamic_range) {
-        BOOST_LOG(info) << "Client requested HDR, but 10-bit SDR is enabled for it; encoding Main10 without HDR";
-        config.monitor.dynamicRange = 1;
-        config.monitor.prefer_sdr_10bit = true;
-      } else {
-        config.monitor.dynamicRange = 0;
-        config.monitor.prefer_sdr_10bit = false;
-        BOOST_LOG(info) << "10-bit SDR is enabled for this client, but Main10 is unavailable; using 8-bit SDR encode";
+    if (!is_pyrowave) {
+      const bool prefer_10bit_sdr = effective_10bit_sdr_requested(*session);
+      const bool hevc_main10 = config.monitor.videoFormat == 1 && video::active_hevc_mode >= 3;
+      const bool av1_main10 = config.monitor.videoFormat == 2 && video::active_av1_mode >= 3;
+      const bool supports_10bit_dynamic_range = hevc_main10 || av1_main10;
+      config.monitor.force_sdr = session->force_sdr;
+      if (prefer_10bit_sdr) {
+        if (supports_10bit_dynamic_range) {
+          BOOST_LOG(info) << "Client requested HDR, but 10-bit SDR is enabled for it; encoding Main10 without HDR";
+          config.monitor.dynamicRange = 1;
+          config.monitor.prefer_sdr_10bit = true;
+        } else {
+          config.monitor.dynamicRange = 0;
+          config.monitor.prefer_sdr_10bit = false;
+          BOOST_LOG(info) << "10-bit SDR is enabled for this client, but Main10 is unavailable; using 8-bit SDR encode";
+        }
+      } else if (config.monitor.dynamicRange == 0) {
+        if (session->enable_hdr && supports_10bit_dynamic_range) {
+          BOOST_LOG(info) << "RTSP ANNOUNCE requested SDR while launch HDR is enabled; using HDR 10-bit encode";
+          config.monitor.dynamicRange = 1;
+        }
       }
-    } else if (config.monitor.dynamicRange == 0) {
-      if (session->enable_hdr && supports_10bit_dynamic_range) {
-        BOOST_LOG(info) << "RTSP ANNOUNCE requested SDR while launch HDR is enabled; using HDR 10-bit encode";
-        config.monitor.dynamicRange = 1;
-      }
+      apply_rtx_hdr_stream_policy(config.monitor);
+    } else {
+      config.monitor.force_sdr = true;
+      config.monitor.prefer_sdr_10bit = false;
+      config.monitor.rtx_hdr_active = false;
     }
-    apply_rtx_hdr_stream_policy(config.monitor);
 
     // If the client sent a configured bitrate, we will choose the actual bitrate ourselves
     // by using FEC percentage and audio quality settings. If the calculated bitrate ends up
@@ -1870,6 +1919,53 @@ namespace rtsp_stream {
 
     auto remote_address = remote_endpoint.address().to_string();
 
+    if (is_pyrowave) {
+      const auto extension = [&](std::string_view name) -> std::string_view {
+        const auto found = args.find(name);
+        return found == args.end() ? std::string_view {} : found->second;
+      };
+      auto video_wire_kbps = config.monitor.client_requested_bitrate;
+      const auto audio_kbps = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
+      video_wire_kbps -= std::min(audio_kbps, video_wire_kbps / 5);
+      video_wire_kbps -= std::min(500, video_wire_kbps / 10);
+      const pyrowave::protocol::transport_config_t transport {
+        .packet_size = static_cast<std::uint32_t>(config.packetsize),
+        .path_mtu = pyrowave_path_mtu,
+        .ip_header_size = remote_endpoint.address().is_v6() ? 40u : 20u,
+        .fec_percentage = static_cast<std::uint32_t>(config::stream.fec_percentage),
+        .min_fec_packets = static_cast<std::uint32_t>(config.minRequiredFecPackets),
+        .encrypted = (config.encryptionFlagsEnabled & SS_ENC_VIDEO) != 0,
+      };
+      const auto negotiated = pyrowave::negotiation::negotiate({
+        .width = config.monitor.width,
+        .height = config.monitor.height,
+        .framerate = config.monitor.framerate,
+        .framerate_x100 = config.monitor.framerateX100,
+        .encoder_bitrate_kbps = config.monitor.bitrate,
+        .video_wire_bitrate_kbps = video_wire_kbps,
+        .dynamic_range = config.monitor.dynamicRange,
+        .chroma_sampling = config.monitor.chromaSamplingType,
+        .encoder_csc_mode = config.monitor.encoderCscMode,
+        .version = extension("x-vp-pyrowave.version"),
+        .bitstream_revision = extension("x-vp-pyrowave.bitstreamRevision"),
+        .profile = extension("x-vp-pyrowave.profile"),
+        .host_enabled = config::video.pyrowave_enabled,
+        .adapter_supported = true,  // The actual probe runs on the startup worker.
+      }, transport);
+      if (!negotiated.accepted || config.monitor.input_only) {
+        BOOST_LOG(warning) << "PyroWave negotiation rejected: " << negotiated.reason;
+        respond(socket->sock, *session, &option, 406, "Unsupported PyroWave session", req->sequenceNumber, {});
+        return false;
+      }
+      config.monitor.pyrowave_protocol_version = pyrowave::protocol::version;
+      config.monitor.pyrowave_path_mtu = pyrowave_path_mtu;
+      config.monitor.pyrowave_frame_budget = negotiated.frame_budget;
+      config.monitor.pyrowave_wire_byte_budget = negotiated.wire_byte_budget;
+      config.monitor.pyrowave_fec_percentage = transport.fec_percentage;
+      config.monitor.pyrowave_encoder_target_bytes = negotiated.encoder_target_bytes;
+      config.monitor.encodingFramerate = negotiated.fps_x100 * 10;
+    }
+
     const int sequence_number = req->sequenceNumber;
     const std::string client_uuid = session->client_uuid;
     auto launch_session = session->clone_for_startup();
@@ -1912,8 +2008,20 @@ namespace rtsp_stream {
         std::shared_ptr<stream::session_t> stream_session;
         bool startup_failed = true;
         std::string startup_error;
+        int startup_status = 500;
 
         try {
+          if (config.monitor.videoFormat == video::codec_wire_value(video::codec_e::pyrowave)) {
+            startup_status = 406;
+            const auto probe = video::probe_pyrowave(true);
+            if (!probe.available) {
+              throw std::runtime_error(probe.reason);
+            }
+            config.monitor.pyrowave_session_lease = video::acquire_pyrowave_session();
+            if (!config.monitor.pyrowave_session_lease) {
+              throw std::runtime_error("PyroWave already has an active or pending session");
+            }
+          }
           stream_session = stream::session::alloc(config, *launch_session);
           startup_failed = stream::session::start(*stream_session, remote_address) != 0;
         } catch (const std::exception &e) {
@@ -1933,7 +2041,7 @@ namespace rtsp_stream {
         // scope. A failed start can hold the last reference, and ~session_t may then run
         // end_broadcast(), which joins a control thread that itself waits on this gate.
         lifecycle_lock.unlock();
-        server->post([server, socket = std::move(socket), session = std::move(session), sequence_number, startup_failed, startup_error = std::move(startup_error), virtual_display_guid_bytes = launch_session->virtual_display_guid_bytes]() mutable {
+        server->post([server, socket = std::move(socket), session = std::move(session), sequence_number, startup_failed, startup_status, startup_error = std::move(startup_error), virtual_display_guid_bytes = launch_session->virtual_display_guid_bytes]() mutable {
           auto fg = util::fail_guard([server, virtual_display_guid_bytes]() {
             server->finish_startup(virtual_display_guid_bytes);
           });
@@ -1948,7 +2056,8 @@ namespace rtsp_stream {
             } else {
               BOOST_LOG(error) << "Failed to start a streaming session: "sv << startup_error;
             }
-            respond(socket->sock, *session, &completion_option, 500, "Internal Server Error", sequence_number, {});
+            respond(socket->sock, *session, &completion_option, startup_status,
+                    startup_status == 406 ? "PyroWave unavailable" : "Internal Server Error", sequence_number, {});
           } else {
             respond(socket->sock, *session, &completion_option, 200, "OK", sequence_number, {});
           }

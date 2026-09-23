@@ -12,3 +12,17 @@ RTX HDR / TrueHDR feature:
 NVIDIA, NVIDIA RTX, GeForce RTX, and related marks are trademarks and/or registered
 trademarks of NVIDIA Corporation in the United States and other countries. The NVIDIA
 RTX Video SDK is governed by NVIDIA's SDK license terms.
+
+Optional PyroWave codec
+
+Windows builds configured with SUNSHINE_ENABLE_PYROWAVE include PyroWave and
+Granite (Copyright Hans-Kristian Arntzen, MIT), volk (MIT), and Vulkan-Headers
+(Apache-2.0/MIT notices as distributed upstream). Exact source revisions and
+complete license texts are installed in licenses/pyrowave with the optional
+libpyrowave-shared-0.dll. PyroWave's embedded shader bytecode is distributed
+under the same pinned project's MIT license. The Vulkan loader and GPU driver
+are supplied by the operating system/driver installation, not this package.
+The optional runtime includes local NT HANDLE ownership, error-path resource
+cleanup fixes and an additive bundle-identity export. The exact patch and its
+checksum accompany the PyroWave license; the upstream API signatures and
+bitstream format are preserved.

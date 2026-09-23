@@ -26,6 +26,9 @@ extern "C" {
 #include "display.h"
 #include "display_vram.h"
 #include "misc.h"
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+  #include "pyrowave_runtime.h"
+#endif
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
   #include "game_activity.h"
   #include "nv_truehdr.h"
@@ -1059,7 +1062,7 @@ namespace platf::dxgi {
     }
 #endif
 
-    void apply_colorspace(const ::video::sunshine_colorspace_t &colorspace, bool rtx_hdr_active) {
+    bool apply_colorspace(const ::video::sunshine_colorspace_t &colorspace, bool rtx_hdr_active) {
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
       // Remember whether we are emitting HDR, so the convert step knows it may need to
       // synthesize HDR from an SDR capture via TrueHDR.
@@ -1077,18 +1080,19 @@ namespace platf::dxgi {
 
       if (!color_vectors) {
         BOOST_LOG(error) << "No vector data for colorspace"sv;
-        return;
+        return false;
       }
 
       auto color_matrix = make_buffer(device.get(), *color_vectors);
       if (!color_matrix) {
         BOOST_LOG(warning) << "Failed to create color matrix"sv;
-        return;
+        return false;
       }
 
       device_ctx->VSSetConstantBuffers(3, 1, &color_matrix);
       device_ctx->PSSetConstantBuffers(0, 1, &color_matrix);
       this->color_matrix = std::move(color_matrix);
+      return true;
     }
 
     int set_output_texture(ID3D11Texture2D *frame_texture) {
@@ -1155,7 +1159,7 @@ namespace platf::dxgi {
       return 0;
     }
 
-    int init_output(ID3D11Texture2D *frame_texture, int width, int height, const ::video::sunshine_colorspace_t &colorspace) {
+    int init_output(ID3D11Texture2D *frame_texture, int width, int height, const ::video::sunshine_colorspace_t &colorspace, ID3D11Texture2D *chroma_texture = nullptr) {
 
       HRESULT status = S_OK;
 
@@ -1384,6 +1388,9 @@ namespace platf::dxgi {
       }
 
       if (dynamic_output_textures) {
+        if (chroma_texture) {
+          return -1;
+        }
         return set_output_texture(frame_texture);
       }
 
@@ -1391,18 +1398,22 @@ namespace platf::dxgi {
       // users. Native AMF alone opts into the rotating texture map above.
       frame_texture->AddRef();
       fixed_output_texture.reset(frame_texture);
+      if (chroma_texture) {
+        chroma_texture->AddRef();
+      }
+      fixed_chroma_texture.reset(chroma_texture);
       // Keep the raw output pointer in sync for consumers shared with the
       // dynamic path (TrueHDR live readback dereferences it unconditionally).
       output_texture = frame_texture;
 
-      auto create_fixed_rtv = [&](auto &target, DXGI_FORMAT view_format) -> bool {
+      auto create_fixed_rtv = [&](auto &target, DXGI_FORMAT view_format, ID3D11Texture2D *texture) -> bool {
         if (view_format == DXGI_FORMAT_UNKNOWN) {
           return true;
         }
         D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
         rtv_desc.Format = view_format;
         rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-        const auto create_status = device->CreateRenderTargetView(fixed_output_texture.get(), &rtv_desc, &target);
+        const auto create_status = device->CreateRenderTargetView(texture, &rtv_desc, &target);
         if (FAILED(create_status)) {
           BOOST_LOG(error) << "Failed to create render target view: " << util::log_hex(create_status);
           return false;
@@ -1410,8 +1421,8 @@ namespace platf::dxgi {
         return true;
       };
 
-      if (!create_fixed_rtv(fixed_out_Y_or_YUV_rtv, output_y_or_yuv_rtv_format) ||
-          !create_fixed_rtv(fixed_out_UV_rtv, output_uv_rtv_format)) {
+      if (!create_fixed_rtv(fixed_out_Y_or_YUV_rtv, output_y_or_yuv_rtv_format, fixed_output_texture.get()) ||
+          !create_fixed_rtv(fixed_out_UV_rtv, output_uv_rtv_format, fixed_chroma_texture ? fixed_chroma_texture.get() : fixed_output_texture.get())) {
         return -1;
       }
       out_Y_or_YUV_rtv = fixed_out_Y_or_YUV_rtv.get();
@@ -1904,6 +1915,7 @@ namespace platf::dxgi {
     ID3D11Texture2D *output_texture = nullptr;
     std::map<ID3D11Texture2D *, output_target_t> output_targets;
     texture2d_t fixed_output_texture;
+    texture2d_t fixed_chroma_texture;
     render_target_t fixed_out_Y_or_YUV_rtv;
     render_target_t fixed_out_UV_rtv;
     DXGI_FORMAT output_y_or_yuv_rtv_format = DXGI_FORMAT_UNKNOWN;
@@ -2392,6 +2404,154 @@ namespace platf::dxgi {
     platf::pix_fmt_e buffer_format = platf::pix_fmt_e::unknown;
     bool registered_active_encoder = false;
   };
+
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+  class d3d_pyrowave_encode_device_t final: public pyrowave_encode_device_t {
+  public:
+    ~d3d_pyrowave_encode_device_t() override {
+      // Finish Vulkan's use of the imported targets before dropping the
+      // converter context's bindings and the underlying D3D resources.
+      runtime.reset();
+      if (base.device_ctx) {
+        base.device_ctx->ClearState();
+        base.device_ctx->Flush();
+      }
+    }
+
+    std::string error_reason() const override { return failure_reason; }
+
+    bool init_device(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter) {
+      if (!adapter || FAILED(adapter->GetDesc(&adapter_desc)) || base.init(std::move(display), adapter, pix_fmt_e::nv12) != 0) {
+        failure_reason = "Cannot create the D3D11 device on the capture adapter";
+        BOOST_LOG(error) << "PyroWave: cannot create the D3D11 device on the capture adapter";
+        return false;
+      }
+      multithread_t multithread;
+      const auto status = base.device->QueryInterface(IID_ID3D11Multithread, reinterpret_cast<void **>(&multithread));
+      if (FAILED(status)) {
+        failure_reason = "Cannot enable D3D11 multithread protection";
+        BOOST_LOG(error) << "PyroWave: cannot enable D3D11 multithread protection: " << util::log_hex(status);
+        return false;
+      }
+      multithread->SetMultithreadProtected(TRUE);
+      return true;
+    }
+
+    bool init_encoder(const ::video::config_t &config, const ::video::sunshine_colorspace_t &requested_colorspace) override {
+      failure_reason.clear();
+      if (runtime || config.width <= 0 || config.height <= 0 || config.width > 8192 || config.height > 8192 ||
+          (config.width & 1) || (config.height & 1) || config.dynamicRange != 0 || config.chromaSamplingType != 0 || config.rtx_hdr_active ||
+          requested_colorspace.colorspace != ::video::colorspace_e::rec709 || !requested_colorspace.full_range || requested_colorspace.bit_depth != 8) {
+        failure_reason = "Unsupported profile; expected even SDR BT.709 full-range 8-bit 4:2:0 dimensions";
+        BOOST_LOG(error) << "PyroWave: unsupported profile; expected even SDR BT.709 full-range 8-bit 4:2:0";
+        return false;
+      }
+      colorspace = {::video::colorspace_e::rec709, true, 8};
+      rtx_hdr_active = false;
+      hdr_metadata_valid = false;
+
+      D3D11_TEXTURE2D_DESC desc {};
+      desc.Width = config.width;
+      desc.Height = config.height;
+      desc.MipLevels = desc.ArraySize = 1;
+      desc.Format = DXGI_FORMAT_R8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+      desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+      auto status = base.device->CreateTexture2D(&desc, nullptr, &target);
+      if (FAILED(status)) {
+        failure_reason = "Shared luma texture creation failed (HRESULT " + std::to_string(static_cast<unsigned long>(status)) + ')';
+        BOOST_LOG(error) << "PyroWave: shared luma texture creation failed: " << util::log_hex(status);
+        return false;
+      }
+      desc.Width /= 2;
+      desc.Height /= 2;
+      desc.Format = DXGI_FORMAT_R8G8_UNORM;
+      status = base.device->CreateTexture2D(&desc, nullptr, &chroma_target);
+      if (FAILED(status)) {
+        failure_reason = "Shared chroma texture creation failed (HRESULT " + std::to_string(static_cast<unsigned long>(status)) + ')';
+        BOOST_LOG(error) << "PyroWave: shared chroma texture creation failed: " << util::log_hex(status);
+        return false;
+      }
+      if (!base.apply_colorspace(colorspace, false) || base.init_output(target.get(), config.width, config.height, colorspace, chroma_target.get()) != 0) {
+        failure_reason = "Cannot initialize the SDR BT.709 conversion shaders and render targets";
+        return false;
+      }
+      // The established converter emits left-sited chroma. PWVF carries this
+      // explicitly; upstream's default centered color bits are not authoritative.
+      runtime = ::platf::pyrowave::encoder_t::create(base.device.get(), base.device_ctx.get(), target.get(), chroma_target.get(), adapter_desc.AdapterLuid, failure_reason);
+      if (!runtime) {
+        BOOST_LOG(error) << "PyroWave: " << failure_reason;
+        return false;
+      }
+      BOOST_LOG(info) << "PyroWave: created R8/R8G8 Vulkan encoder on capture adapter LUID "
+                      << std::hex << static_cast<std::uint32_t>(adapter_desc.AdapterLuid.HighPart) << ':'
+                      << adapter_desc.AdapterLuid.LowPart << std::dec;
+      return true;
+    }
+
+    int convert(platf::img_t &img) override {
+      if (!runtime || !runtime->prepare_target(failure_reason)) {
+        if (failure_reason.empty()) failure_reason = "Encoder is not initialized";
+        BOOST_LOG(error) << "PyroWave: " << (failure_reason.empty() ? "encoder is not initialized" : failure_reason);
+        return -1;
+      }
+      if (base.convert(img) != 0) {
+        failure_reason = "Captured image conversion failed; see the host log for its D3D11 error";
+        return -1;
+      }
+      base.device_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+      if (!runtime->submit_conversion(failure_reason)) {
+        BOOST_LOG(error) << "PyroWave: " << failure_reason;
+        return -1;
+      }
+      return 0;
+    }
+
+    std::optional<std::vector<std::vector<std::uint8_t>>> encode_frame(std::uint64_t frame_index, std::size_t target_bytes) override {
+      (void) frame_index;  // The outer PWVF/RTP frame identity belongs to video.cpp.
+      if (!runtime) {
+        failure_reason = "Encoder is not initialized";
+        return std::nullopt;
+      }
+      auto packets = runtime->encode(target_bytes, failure_reason);
+      if (!packets) {
+        BOOST_LOG(error) << "PyroWave: " << failure_reason;
+      } else {
+        const auto sample = runtime->last_frame_statistics();
+        statistics.interop_submit_us += sample.interop_submit_us;
+        statistics.encode_wait_us += sample.encode_wait_us;
+        statistics.packetize_us += sample.packetize_us;
+        statistics.native_bytes += sample.native_bytes;
+        statistics.native_packets += sample.native_packets;
+        if (++statistics_frames == 300) {
+          BOOST_LOG(info) << "PyroWave runtime mean over " << statistics_frames << " frames: interop_submit_us="
+                          << statistics.interop_submit_us / statistics_frames << " encode_wait_us="
+                          << statistics.encode_wait_us / statistics_frames << " packetize_us="
+                          << statistics.packetize_us / statistics_frames << " native_bytes="
+                          << statistics.native_bytes / statistics_frames << " native_packets="
+                          << static_cast<double>(statistics.native_packets) / statistics_frames;
+          statistics = {};
+          statistics_frames = 0;
+        }
+      }
+      return packets;
+    }
+
+  private:
+    // Reverse destruction order releases Vulkan before the target, then the
+    // D3D converter and finally its capture-display lease.
+    d3d_base_encode_device base;
+    texture2d_t target;
+    texture2d_t chroma_target;
+    std::unique_ptr<::platf::pyrowave::encoder_t> runtime;
+    DXGI_ADAPTER_DESC adapter_desc {};
+    std::string failure_reason;
+    ::platf::pyrowave::frame_statistics_t statistics;
+    std::uint32_t statistics_frames = 0;
+  };
+#endif
 
   bool set_cursor_texture(device_t::pointer device, gpu_cursor_t &cursor, util::buffer_t<std::uint8_t> &&cursor_img, DXGI_OUTDUPL_POINTER_SHAPE_INFO &shape_info) {
     // This cursor image may not be used
@@ -3203,6 +3363,18 @@ namespace platf::dxgi {
       return nullptr;
     }
     return device;
+  }
+
+  std::unique_ptr<pyrowave_encode_device_t> display_vram_t::make_pyrowave_encode_device() {
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+    auto device = std::make_unique<d3d_pyrowave_encode_device_t>();
+    if (!device->init_device(shared_from_this(), adapter.get())) {
+      return nullptr;
+    }
+    return device;
+#else
+    return nullptr;
+#endif
   }
 
   int init() {

@@ -67,6 +67,7 @@
 #include "stream.h"
 #include "host_stats.h"
 #include "video.h"
+#include "pyrowave_protocol.h"
 #include "webrtc_stream.h"
 
 #ifdef _WIN32
@@ -3397,6 +3398,28 @@ namespace confighttp {
     send_response(response, output);
   }
 
+  void getPyroWaveCapabilities(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    auto config_gate = config::acquire_apply_read_gate();
+    nlohmann::json output;
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+    output["compiled"] = true;
+#else
+    output["compiled"] = false;
+#endif
+    output["enabled"] = config::video.pyrowave_enabled;
+    const auto probe = video::probe_pyrowave(true);
+    output["available"] = probe.available;
+    output["reason"] = probe.reason;
+    output["adapter"] = probe.adapter_identity;
+    output["protocol_version"] = pyrowave::protocol::version;
+    output["bitstream_revision"] = std::string(pyrowave::protocol::bitstream_revision);
+    output["profile"] = std::string(pyrowave::protocol::profile);
+    send_response(response, output, "no-store");
+  }
+
   void getWebRTCCapabilities(resp_https_t response, req_https_t request) {
     if (!authenticate(response, request)) {
       return;
@@ -5809,6 +5832,7 @@ namespace confighttp {
     register_api_route("^/api/host/info$", "GET", getHostInfo);
     register_api_route("^/api/rtsp/sessions$", "GET", listRTSPSessions);
     register_blocking_api_route("^/api/webrtc/capabilities$", "GET", getWebRTCCapabilities);
+    register_blocking_api_route("^/api/pyrowave/capabilities$", "GET", getPyroWaveCapabilities);
     register_api_route("^/api/webrtc/sessions$", "GET", listWebRTCSessions);
     register_api_route("^/api/history/sessions$", "GET", listSessionHistory);
     register_api_route("^/api/history/sessions/active$", "GET", getActiveSessionHistory);

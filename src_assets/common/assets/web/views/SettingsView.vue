@@ -6,6 +6,7 @@ import { apiGet, apiPatch, apiPost } from '@/api/client';
 import DisplayModeOverrides from '@/components/settings/DisplayModeOverrides.vue';
 import DisplayRecoverySettings from '@/components/settings/DisplayRecoverySettings.vue';
 import GlobalPrepCommands from '@/components/settings/GlobalPrepCommands.vue';
+import PyroWaveStatus from '@/components/settings/PyroWaveStatus.vue';
 import SettingsIntegrationPath from '@/components/settings/SettingsIntegrationPath.vue';
 import { InlineAlert, LoadingSkeleton, PageHeader, StatusBadge, UiIcon } from '@/components/ui';
 import {
@@ -928,6 +929,9 @@ onMounted(() => void load());
                   />
                 </div>
               </div>
+              <PyroWaveStatus
+                v-if="group.fields.some((field) => field.key === 'pyrowave_enabled')"
+              />
               <div
                 v-if="
                   activeCategory === 'everyday' &&

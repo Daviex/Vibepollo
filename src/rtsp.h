@@ -61,6 +61,7 @@ namespace rtsp_stream {
     int appid;
 
     bool input_only;
+    bool pyrowave_requested = false;
     bool host_audio;
     int width;
     int height;

@@ -661,6 +661,7 @@ export const settingsCategories: SettingsCategory[] = [
             option('2', 'ui.settings.options.codec.eight_bit'),
             option('3', 'ui.settings.options.codec.hdr_ten_bit'),
           ]),
+          boolean('pyrowave_enabled', { platform: 'windows' }),
         ],
       },
       {
@@ -852,6 +853,7 @@ export const settingsDefaults: Record<string, unknown> = {
   wgc_pacing_smoothing: true,
   hevc_mode: 0,
   av1_mode: 0,
+  pyrowave_enabled: false,
   max_bitrate: 0,
   minimum_fps_target: 20,
   qp: 28,

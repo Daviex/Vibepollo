@@ -3,3 +3,5 @@ Dockerfile text eol=lf
 *.dockerfile text eol=lf
 *flatpak-lint-*.json text eol=lf
 *.sh text eol=lf
+# The optional dependency patch is checksum-verified before application.
+cmake/patches/*.patch text eol=lf

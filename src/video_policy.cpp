@@ -17,7 +17,8 @@ namespace video::policy {
   ) {
     for (const auto name : preference) {
       const auto caps = provider.capabilities(name);
-      if (caps.available && (!requirements.hdr || caps.hdr) && (!requirements.yuv444 || caps.yuv444)) {
+      if (caps.available && (caps.supported_codecs & codec_bit(requirements.codec)) &&
+          (!requirements.hdr || caps.hdr) && (!requirements.yuv444 || caps.yuv444)) {
         return std::string(name);
       }
     }

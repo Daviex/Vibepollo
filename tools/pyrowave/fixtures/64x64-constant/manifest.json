@@ -1,0 +1,20 @@
+{
+  "fixture_version": 1,
+  "api_version": "0.5.0",
+  "bitstream_revision": "d2997ac172bdc00e29c58e3f2938acb7e94580bf",
+  "profile": "sdr-bt709-full-left-420",
+  "width": 64,
+  "height": 64,
+  "synthetic_pattern": "constant",
+  "synthetic_frame_index": 0,
+  "source_layout": "NV12",
+  "target_bytes": 65536,
+  "source_sha256": "e65325b504d8b1221b563b8ee8808eafa39443cf766b93ffe6b94e751cf80b87",
+  "pwvf_sha256": "891b155645218eac49bf911d8378afa002ace9440ae67ed8ed70cacc2288ca32",
+  "pwvf_size": 264,
+  "decoded_plane_sha256": ["e5bdd48d0118bad7f82397c719214633757480391bd2d638e86dcce22723ab0b", "ac4601ebdc4d1301a36e7bf6e25b9e80cfd781c3da7a31b65fc1ac1ef7386f1c", "2b1e591826ab75708d32a6ef5edf7fb6ff6222e9e94866d8ca428fa2e47526e4"],
+  "decoded_plane_mae": [0, 0, 0],
+  "native_packets": [
+    {"file": "packet-0.bin", "bytes": 228, "sha256": "cc39675639511bd5c2899930c1bf093969498a6941a9d41e26c01aa3a26c5e69"}
+  ]
+}

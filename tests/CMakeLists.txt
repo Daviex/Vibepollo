@@ -334,6 +334,21 @@ endfunction()
 
 sunshine_register_component(NAME test_component_stream_protocol TEST_SOURCE unit/test_stream.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/stream_protocol.cpp")
+sunshine_register_component(NAME test_component_rtsp_startup_snapshot TEST_SOURCE unit/test_rtsp_startup_snapshot.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/rtsp_launch_snapshot.cpp"
+    LINK_LIBRARIES OpenSSL::Crypto)
+sunshine_register_component(NAME test_component_pyrowave_protocol TEST_SOURCE unit/test_pyrowave_protocol.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/pyrowave_protocol.cpp")
+sunshine_register_component(NAME test_component_pyrowave_negotiation TEST_SOURCE unit/test_pyrowave_negotiation.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/pyrowave_negotiation.cpp"
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/pyrowave_protocol.cpp")
+sunshine_register_component(NAME test_component_pyrowave_transport TEST_SOURCE unit/test_pyrowave_transport.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/pyrowave_transport.cpp"
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/pyrowave_protocol.cpp"
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/stream_protocol.cpp"
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/crypto.cpp"
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/rswrapper.c"
+    LINK_LIBRARIES OpenSSL::Crypto sunshine_test_nanors_headers $<$<PLATFORM_ID:Windows>:ws2_32>)
 sunshine_register_component(NAME test_component_config_parse TEST_SOURCE unit/test_config_parse.cpp
     PRODUCT_SOURCES)
 sunshine_register_component(NAME test_component_config_playnite TEST_SOURCE test_config_playnite.cpp

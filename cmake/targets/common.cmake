@@ -29,6 +29,20 @@ endif()
 target_link_libraries(sunshine ${SUNSHINE_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
 target_compile_definitions(sunshine PUBLIC ${SUNSHINE_DEFINITIONS})
 
+if(SUNSHINE_ENABLE_PYROWAVE)
+    # Refresh even when only the optional DLL changed and sunshine does not
+    # relink. CMP0112 NEW (from our CMake 3.20 minimum) makes TARGET_FILE_DIR a
+    # directory query without an implicit dependency back to sunshine.
+    add_custom_target(sunshine_stage_pyrowave_runtime
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sunshine>"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${SUNSHINE_PYROWAVE_RUNTIME_FILE}" "$<TARGET_FILE_DIR:sunshine>"
+        DEPENDS sunshine_pyrowave_runtime
+        COMMENT "Staging the optional PyroWave runtime beside the server"
+        VERBATIM)
+    add_dependencies(sunshine sunshine_stage_pyrowave_runtime)
+endif()
+
 # Logging integration flags are provided via SUNSHINE_DEFINITIONS to avoid duplicates
 set_target_properties(sunshine PROPERTIES CXX_STANDARD 23
         VERSION ${PROJECT_VERSION}

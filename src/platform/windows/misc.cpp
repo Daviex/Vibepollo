@@ -5,6 +5,7 @@
 // standard includes
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <csignal>
 #include <filesystem>
@@ -487,6 +488,37 @@ namespace platf {
   }
 
   HDESK syncThreadDesktop() {
+    struct thread_desktop_t {
+      // GetThreadDesktop returns a borrowed handle, which must never be closed.
+      HDESK initial = GetThreadDesktop(GetCurrentThreadId());
+      HDESK owned = nullptr;
+
+      ~thread_desktop_t() {
+        if (!owned) {
+          return;
+        }
+        if (GetThreadDesktop(GetCurrentThreadId()) == owned && !SetThreadDesktop(initial)) {
+          const auto err = GetLastError();
+          // Windows refuses a switch while this thread owns windows or hooks.
+          // Keep the still-associated handle valid rather than closing it early.
+          BOOST_LOG(warning) << "Failed to restore thread desktop during cleanup [0x"sv
+                             << util::hex(err).to_string_view() << ']';
+          return;
+        }
+        if (!CloseDesktop(owned)) {
+          const auto err = GetLastError();
+          BOOST_LOG(warning) << "Failed to close thread desktop during cleanup [0x"sv
+                             << util::hex(err).to_string_view() << ']';
+        }
+      }
+    };
+    static thread_local thread_desktop_t desktop;
+
+    if (!desktop.initial) {
+      BOOST_LOG(error) << "Failed to get the initial thread desktop"sv;
+      return nullptr;
+    }
+
     auto hDesk = OpenInputDesktop(DF_ALLOWOTHERACCOUNTHOOK, FALSE, GENERIC_ALL);
     if (!hDesk) {
       auto err = GetLastError();
@@ -495,14 +527,37 @@ namespace platf {
       return nullptr;
     }
 
-    if (!SetThreadDesktop(hDesk)) {
-      auto err = GetLastError();
-      BOOST_LOG(error) << "Failed to sync desktop to thread [0x"sv << util::hex(err).to_string_view() << ']';
+    // Compare the objects, not handle values: OpenInputDesktop returns a new
+    // handle even when the input desktop has not changed. Keeping the returned
+    // value stable also lets input callers stop retrying on an unchanged desktop.
+    using compare_object_handles_t = BOOL(WINAPI *)(HANDLE, HANDLE);
+    static const auto compare_objects = []() {
+      const auto kernelbase = GetModuleHandleW(L"kernelbase.dll");
+      return kernelbase ? std::bit_cast<compare_object_handles_t>(GetProcAddress(kernelbase, "CompareObjectHandles")) : nullptr;
+    }();
+    if (desktop.owned && GetThreadDesktop(GetCurrentThreadId()) == desktop.owned &&
+        compare_objects && compare_objects(desktop.owned, hDesk)) {
+      CloseDesktop(hDesk);
+      return desktop.owned;
     }
 
-    CloseDesktop(hDesk);
+    if (!SetThreadDesktop(hDesk)) {
+      auto err = GetLastError();
+      CloseDesktop(hDesk);
+      BOOST_LOG(error) << "Failed to sync desktop to thread [0x"sv << util::hex(err).to_string_view() << ']';
+      return nullptr;
+    }
 
-    return hDesk;
+    // CloseDesktop fails with ERROR_BUSY for the handle currently assigned to
+    // this thread. Retain the new handle and retire the old one after switching.
+    if (desktop.owned && !CloseDesktop(desktop.owned)) {
+      const auto err = GetLastError();
+      BOOST_LOG(warning) << "Failed to close the previous thread desktop [0x"sv
+                         << util::hex(err).to_string_view() << ']';
+    }
+    desktop.owned = hDesk;
+
+    return desktop.owned;
   }
 
   void print_status(const std::string_view &prefix, HRESULT status) {

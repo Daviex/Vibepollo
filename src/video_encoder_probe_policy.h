@@ -9,15 +9,22 @@
 
 namespace video::encoder_probe_policy {
 
+  enum class probe_kind_e {
+    standard,
+    pyrowave,
+  };
+
   struct cache_key_t {
     std::string encoder_configuration;
     std::string adapter_identity;
     bool adapter_identity_resolved = false;
+    probe_kind_e kind = probe_kind_e::standard;
 
     bool operator==(const cache_key_t &other) const {
       return encoder_configuration == other.encoder_configuration &&
              adapter_identity == other.adapter_identity &&
-             adapter_identity_resolved == other.adapter_identity_resolved;
+             adapter_identity_resolved == other.adapter_identity_resolved &&
+             kind == other.kind;
     }
   };
 

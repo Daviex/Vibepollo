@@ -4341,6 +4341,28 @@ Hides the interactive controls in the system-tray menu.
 
 Allows streaming to continue when the encoder capability probe cannot complete.
 
+### pyrowave_enabled
+
+Enables the experimental PyroWave codec for clients that explicitly negotiate
+the VibePollo PyroWave extension. Default: `disabled`.
+
+Requires a Windows x64 build configured with `SUNSHINE_ENABLE_PYROWAVE=ON`, the
+packaged PyroWave runtime and a successful GPU/interoperability check on the capture
+adapter. The initial profile is SDR BT.709 full-range 4:2:0 with left chroma siting.
+Standard H.264, HEVC and AV1 sessions keep their normal negotiation.
+
+Set `pyrowave_enabled = disabled` to prevent new PyroWave sessions. Once applied,
+disabling the feature also stops an active PyroWave capture; it never switches
+that session to another codec. Deferred settings apply according to the normal
+server session lifecycle. The availability check in the video settings shows
+whether the saved configuration passed the adapter probe and explains failures.
+The experimental runtime retains one GPU context for the process lifetime. After
+initialization, changing the capture GPU, replacing a rejected runtime DLL, or
+recovering from a failed Vulkan device requires a server restart. Encoder and
+capture resources are still released when their session ends.
+See
+[the experimental protocol](pyrowave-protocol-v1.md) for compatibility and scope.
+
 ### keep_sink_default
 
 Keeps the selected audio sink as the system default while streaming.
