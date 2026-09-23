@@ -163,3 +163,158 @@ jobs:
             build/pyrowave-macos/CMakeFiles/CMakeConfigureLog.yaml
             build/pyrowave-macos/compile_commands.json
             build/pyrowave-macos/_deps/pyrowave/stage/licenses/
+
+  linux-x86_64:
+    name: Linux x86_64 / PyroWave Vulkan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      # GCC 14 is available in the official Ubuntu 24.04 runner image and has
+      # the libstdc++ std::format support missing from the local GCC 12 build.
+      # https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md
+      CC: /usr/bin/gcc-14
+      CXX: /usr/bin/g++-14
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout selected revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Select Node.js for the existing Web UI build
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238  # v6.2.0
+        with:
+          node-version: "22.22.2"
+
+      - name: Install build dependencies
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          # Based on scripts/linux_build.sh for KMS/X11. VA libraries are also
+          # needed by the project's prebuilt FFmpeg link dependencies.
+          sudo apt-get update 2>&1 | tee artifacts/dependencies.log
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc-14 g++-14 cmake ninja-build pkg-config \
+            binutils file git ca-certificates \
+            libcap-dev libcurl4-openssl-dev libdrm-dev libevdev-dev \
+            libgbm-dev libglib2.0-dev libminiupnpc-dev libnuma-dev \
+            libopus-dev libpulse-dev libsqlite3-dev libssl-dev \
+            libsystemd-dev libudev-dev libva-dev \
+            libx11-dev libxcb-shm0-dev libxcb-xfixes0-dev libxcb1-dev \
+            libxfixes-dev libxrandr-dev libxtst-dev \
+            python3 python3-jinja2 python3-setuptools \
+            2>&1 | tee -a artifacts/dependencies.log
+
+      - name: Record build environment
+        run: |
+          set -euo pipefail
+          if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo "Expected a Linux x86_64 runner" >&2
+            exit 1
+          fi
+          {
+            cat /etc/os-release
+            uname -m
+            "${CC}" --version
+            "${CXX}" --version
+            cmake --version
+            ninja --version
+            /usr/bin/python3 --version
+            node --version
+            npm --version
+            git rev-parse HEAD
+            git submodule status --recursive
+            sha256sum cmake/patches/pyrowave-0.5.0-nt-handle-ownership.patch
+            cat src/pyrowave_runtime_contract.h
+          } 2>&1 | tee artifacts/environment.log
+          dpkg-query -W -f='${binary:Package}\t${Version}\n' \
+            > artifacts/installed-packages.txt
+
+      - name: Configure host and optional Vulkan runtime
+        run: |
+          set -euo pipefail
+          # SUNSHINE_ENABLE_VULKAN controls FFmpeg Vulkan-video only. The
+          # independent PyroWave Vulkan runtime is enabled by PYROWAVE=ON.
+          cmake -S . -B build/pyrowave-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="${CC}" \
+            -DCMAKE_CXX_COMPILER="${CXX}" \
+            -DCMAKE_CXX_STANDARD=23 \
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_WERROR=OFF \
+            -DSUNSHINE_ENABLE_PYROWAVE=ON \
+            -DSUNSHINE_ENABLE_WEBRTC=OFF \
+            -DSUNSHINE_ENABLE_CUDA=OFF \
+            -DSUNSHINE_ENABLE_VULKAN=OFF \
+            -DSUNSHINE_ENABLE_DRM=ON \
+            -DSUNSHINE_ENABLE_X11=ON \
+            -DSUNSHINE_ENABLE_VAAPI=ON \
+            -DSUNSHINE_ENABLE_WAYLAND=OFF \
+            -DSUNSHINE_ENABLE_KWIN=OFF \
+            -DSUNSHINE_ENABLE_PORTAL=OFF \
+            -DSUNSHINE_ENABLE_TRAY=OFF \
+            -DGLAD_SKIP_PIP_INSTALL=ON \
+            -DPython_EXECUTABLE=/usr/bin/python3 \
+            2>&1 | tee artifacts/configure.log
+
+      - name: Compile sunshine target
+        run: |
+          set -euo pipefail
+          cmake --build build/pyrowave-linux --target sunshine \
+            --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}" \
+            2>&1 | tee artifacts/build.log
+
+      - name: Collect ELF build output
+        run: |
+          set -euo pipefail
+          # Inspect ELF metadata without executing the host, loading the codec,
+          # running ldd, installing anything or invoking the release packager.
+          {
+            file build/pyrowave-linux/sunshine build/pyrowave-linux/libpyrowave-shared.so.0
+            readelf --file-header --dynamic \
+              build/pyrowave-linux/sunshine build/pyrowave-linux/libpyrowave-shared.so.0
+          } 2>&1 | tee artifacts/elf-metadata.log
+          tar -czf artifacts/pyrowave-linux-x86_64-build.tar.gz \
+            -C build/pyrowave-linux sunshine libpyrowave-shared.so.0
+          cp -R build/pyrowave-linux/_deps/pyrowave/stage/licenses artifacts/pyrowave-licenses
+          sha256sum \
+            build/pyrowave-linux/sunshine \
+            build/pyrowave-linux/libpyrowave-shared.so.0 \
+            artifacts/pyrowave-linux-x86_64-build.tar.gz \
+            > artifacts/SHA256SUMS.txt
+          cat > artifacts/README.txt <<'EOF'
+          Compile-only Linux x86_64 build with PyroWave Vulkan enabled.
+          GCC 14 builds the full sunshine target, including KMS/X11 capture and
+          VAAPI. CUDA, FFmpeg Vulkan-video, Wayland, KWin, portal, tray and WebRTC
+          are disabled. Disabling FFmpeg Vulkan-video does not disable PyroWave.
+          No host execution, screen capture, GPU validation, tests, service
+          startup, installation or release publication was performed.
+          The archive contains two ELF build outputs, not an installable package;
+          application assets and ordinary shared dependencies are not bundled.
+          See environment.log, installed-packages.txt, configure.log, build.log,
+          elf-metadata.log and pyrowave-licenses for build provenance.
+          EOF
+
+      - name: Upload build output and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pyrowave-linux-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            artifacts/
+            build/pyrowave-linux/CMakeCache.txt
+            build/pyrowave-linux/CMakeFiles/CMakeConfigureLog.yaml
+            build/pyrowave-linux/compile_commands.json
+            build/pyrowave-linux/_deps/pyrowave/stage/licenses/
