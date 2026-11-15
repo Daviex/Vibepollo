@@ -30,7 +30,7 @@ extern "C" {
 #include "logging.h"
 #include "mouse_input.h"
 #include "platform/common.h"
-#include "thread_pool.h"
+#include "input_executor.h"
 #include "utility.h"
 
 using namespace std::literals;
@@ -110,6 +110,12 @@ namespace input {
   // until the host receives the release, including during session cleanup.
   static std::array<input_t *, BUTTON_X2 + 1> mouse_press_owner {};
 
+  static serial_executor_t input_executor;
+  static std::mutex input_lifecycle_mutex;
+  static bool accepting_inputs = false;
+  // Retain live contexts until worker-owned cleanup, even if a transport drops
+  // its final reference without reset. reset removes them after neutralization.
+  static std::vector<std::shared_ptr<input_t>> active_inputs;
   static platf::input_t platf_input;
   class platform_mouse_backend_t: public mouse_input::backend_t {
   public:
@@ -158,7 +164,7 @@ namespace input {
 
     ~gamepad_t() {
       if (id >= 0) {
-        task_pool.push([id = this->id]() {
+        input_executor.push([id = this->id]() {
           free_gamepad(platf_input, id);
         });
       }
@@ -166,8 +172,10 @@ namespace input {
 
     platf::gamepad_state_t gamepad_state;
     bool guide_key_down = false;
+    bool synthetic_home_down = false;
+    serial_executor_t::task_id_t home_release_id;
 
-    thread_pool_util::ThreadPool::task_id_t back_timeout_id;
+    serial_executor_t::task_id_t back_timeout_id;
 
     int id;
     bool alloc_failed {};
@@ -193,15 +201,18 @@ namespace input {
   // Controller packets and timer releases must not release a held bound key.
   void send_gamepad_state(const gamepad_t &gamepad) {
     auto state = gamepad.gamepad_state;
-    if (gamepad.guide_key_down) {
+    if (gamepad.guide_key_down || gamepad.synthetic_home_down) {
       state.buttonFlags |= platf::HOME;
     }
     platf::gamepad_update(platf_input, gamepad.id, state);
   }
 
   void reset_gamepad(gamepad_t &gamepad) {
+    input_executor.cancel(gamepad.home_release_id);
+    gamepad.home_release_id = nullptr;
+    gamepad.synthetic_home_down = false;
     if (gamepad.back_timeout_id) {
-      task_pool.cancel(gamepad.back_timeout_id);
+      input_executor.cancel(gamepad.back_timeout_id);
       gamepad.back_timeout_id = nullptr;
     }
     if (gamepad.id >= 0) {
@@ -242,7 +253,6 @@ namespace input {
         guide_button_key {guide_button.key},
         guide_button_controller {guide_button.controller},
         gamepads(MAX_GAMEPADS),
-        client_context {platf::allocate_client_input_context(platf_input)},
         touch_port_event {std::move(touch_port_event)},
         feedback_queue {std::move(feedback_queue)},
         input_queue_task_scheduled {false},
@@ -255,7 +265,7 @@ namespace input {
     // Keep track of alt+ctrl+shift key combo
     int shortcutFlags;
     std::unordered_map<uint16_t, held_key_t> keys;
-    task_pool_util::TaskPool::task_id_t key_press_repeat_id {};
+    serial_executor_t::task_id_t key_press_repeat_id {};
     uint16_t repeating_key = 0;
 
     // Captured from this session's effective app/client configuration at launch.
@@ -286,7 +296,7 @@ namespace input {
     // The worker consumes only newer touch-port event versions.
     std::uint64_t observed_touch_port_event_generation {};
 
-    thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;
+    serial_executor_t::task_id_t mouse_left_button_timeout;
     bool mouse_left_button_delay = true;
 
     input::touch_port_t touch_port;
@@ -903,7 +913,7 @@ namespace input {
         mouse_press_owner[BUTTON_LEFT] = nullptr;
       };
 
-      input->mouse_left_button_timeout = task_pool.pushDelayed(std::move(f), 10ms).task_id;
+      input->mouse_left_button_timeout = input_executor.pushDelayed(std::move(f), 10ms).task_id;
 
       return;
     }
@@ -1044,6 +1054,13 @@ namespace input {
   }
 
   void repeat_key(std::shared_ptr<input_t> input, uint16_t key_code) {
+    {
+      std::lock_guard lock(input->input_queue_lock);
+      if (input->input_closed) {
+        input->key_press_repeat_id = nullptr;
+        return;
+      }
+    }
     auto it = input->keys.find(key_code);
     if (it == input->keys.end()) {
       input->key_press_repeat_id = nullptr;
@@ -1061,7 +1078,7 @@ namespace input {
     native_repeat = platf::keyboard_uses_native_repeat(platf_input, host.key);
 #endif
     if (!native_repeat) send_key_and_modifiers(held, input->shortcutFlags);
-    input->key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_period, input, key_code).task_id;
+    input->key_press_repeat_id = input_executor.pushDelayed(repeat_key, config::input.key_repeat_period, input, key_code).task_id;
   }
 
   bool passthrough_guide_key(input_t &input, uint16_t key_code, bool release, bool guide_press_allowed = true) {
@@ -1105,7 +1122,7 @@ namespace input {
         return;
       }
       if (input->repeating_key == key_code) {
-        task_pool.cancel(input->key_press_repeat_id);
+        input_executor.cancel(input->key_press_repeat_id);
         input->key_press_repeat_id = nullptr;
       }
       release_key(it->second);
@@ -1157,7 +1174,7 @@ namespace input {
       send_key_and_modifiers(held, input->shortcutFlags);
     }
     refresh_shortcut_flags(*input);
-    task_pool.cancel(input->key_press_repeat_id);
+    input_executor.cancel(input->key_press_repeat_id);
     input->key_press_repeat_id = nullptr;
     input->repeating_key = key_code;
     bool native_repeat = false;
@@ -1168,7 +1185,7 @@ namespace input {
     native_repeat = platf::keyboard_uses_native_repeat(platf_input, host.key);
 #endif
     if (!native_repeat && config::input.key_repeat_delay.count() > 0) {
-      input->key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, input, key_code).task_id;
+      input->key_press_repeat_id = input_executor.pushDelayed(repeat_key, config::input.key_repeat_delay, input, key_code).task_id;
     }
   }
 
@@ -1728,6 +1745,11 @@ namespace input {
         if (config::input.back_button_timeout >= 0ms) {
           auto f = [input, controller = packet->controllerNumber]() {
             auto &gamepad = input->gamepads[controller];
+            gamepad.back_timeout_id = nullptr;
+            {
+              std::lock_guard lock(input->input_queue_lock);
+              if (input->input_closed) return;
+            }
 
             auto &state = gamepad.gamepad_state;
 
@@ -1736,24 +1758,24 @@ namespace input {
             state.buttonFlags &= ~platf::BACK;
             send_gamepad_state(gamepad);
 
-            // Press Home button
-            state.buttonFlags |= platf::HOME;
+            // Keep the synthetic pulse separate from the latest client state.
+            // New packets, native Home and a held Guide binding remain live
+            // while the pulse is held; no input worker sleep is necessary.
+            input_executor.cancel(gamepad.home_release_id);
+            gamepad.synthetic_home_down = true;
             send_gamepad_state(gamepad);
-
-            // Sleep for a short time to allow the input to be detected
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-            // Release Home button
-            state.buttonFlags &= ~platf::HOME;
-            send_gamepad_state(gamepad);
-
-            gamepad.back_timeout_id = nullptr;
+            gamepad.home_release_id = input_executor.pushDelayedRelease([input, controller]() {
+              auto &current = input->gamepads[controller];
+              current.home_release_id = nullptr;
+              current.synthetic_home_down = false;
+              if (current.id >= 0) send_gamepad_state(current);
+            }, 100ms).task_id;
           };
 
-          gamepad.back_timeout_id = task_pool.pushDelayed(std::move(f), config::input.back_button_timeout).task_id;
+          gamepad.back_timeout_id = input_executor.pushDelayed(std::move(f), config::input.back_button_timeout).task_id;
         }
       } else if (gamepad.back_timeout_id) {
-        task_pool.cancel(gamepad.back_timeout_id);
+        input_executor.cancel(gamepad.back_timeout_id);
         gamepad.back_timeout_id = nullptr;
       }
     }
@@ -1779,10 +1801,10 @@ namespace input {
     short deltaY;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->deltaX), util::endian::big(src->deltaX), &deltaX)) {
+    if (__builtin_add_overflow(util::endian::big(dest->deltaX), util::endian::big(src->deltaX), &deltaX)) {
       return batch_result_e::terminate_batch;
     }
-    if (!__builtin_add_overflow(util::endian::big(dest->deltaY), util::endian::big(src->deltaY), &deltaY)) {
+    if (__builtin_add_overflow(util::endian::big(dest->deltaY), util::endian::big(src->deltaY), &deltaY)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1819,7 +1841,7 @@ namespace input {
     short scrollAmt;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->scrollAmt1), util::endian::big(src->scrollAmt1), &scrollAmt)) {
+    if (__builtin_add_overflow(util::endian::big(dest->scrollAmt1), util::endian::big(src->scrollAmt1), &scrollAmt)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1839,7 +1861,7 @@ namespace input {
     short scrollAmt;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->scrollAmount), util::endian::big(src->scrollAmount), &scrollAmt)) {
+    if (__builtin_add_overflow(util::endian::big(dest->scrollAmount), util::endian::big(src->scrollAmount), &scrollAmt)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -2198,7 +2220,7 @@ namespace input {
       }
     }
     if (schedule_next) {
-      task_pool.push(passthrough_next_message, std::move(input));
+      input_executor.push(passthrough_next_message, std::move(input));
     }
   }
 
@@ -2226,7 +2248,7 @@ namespace input {
       }
     }
     if (schedule_input_task) {
-      task_pool.push(passthrough_next_message, input);
+      input_executor.push(passthrough_next_message, input);
     }
   }
 
@@ -2240,15 +2262,15 @@ namespace input {
       if (input->input_closed) return;
       schedule_worker = geometry::request_serialized_worker_wake(input->input_queue_task_scheduled);
     }
-    if (schedule_worker) task_pool.push(passthrough_next_message, input);
+    if (schedule_worker) input_executor.push(passthrough_next_message, input);
 
     // The recurring timer holds only a weak reference and stops when reset
     // seals the session input queue.
-    task_pool.pushDelayed(input_geometry_refresh_tick, 50ms, weak_input);
+    input_executor.pushDelayed(input_geometry_refresh_tick, 50ms, weak_input);
   }
 
   void start_input_geometry_refresh(const std::shared_ptr<input_t> &input) {
-    task_pool.pushDelayed(input_geometry_refresh_tick, 50ms, std::weak_ptr<input_t> {input});
+    input_executor.pushDelayed(input_geometry_refresh_tick, 50ms, std::weak_ptr<input_t> {input});
   }
 
   /**
@@ -2333,7 +2355,7 @@ namespace input {
       schedule_input_task = geometry::request_serialized_worker_wake(input->input_queue_task_scheduled);
     }
     if (schedule_input_task) {
-      task_pool.push(passthrough_next_message, input);
+      input_executor.push(passthrough_next_message, input);
     }
   }
 
@@ -2347,66 +2369,82 @@ namespace input {
   }
 #endif
 
-  void reset(std::shared_ptr<input_t> &input) {
-    if (!input) {
-      return;
+  // Only the input worker calls this, including global shutdown finalization.
+  // It is idempotent because a reset callback may already precede shutdown.
+  void release_input(const std::shared_ptr<input_t> &input) {
+    input_executor.cancel(input->key_press_repeat_id);
+    input->key_press_repeat_id = nullptr;
+    input_executor.cancel(input->mouse_left_button_timeout);
+    input->mouse_left_button_timeout = nullptr;
+    for (int x = 1; x < mouse_press.size(); ++x) {
+      if (mouse_press_owner[x] == input.get()) {
+        platf::button_mouse(platf_input, x, true);
+        mouse_press[x] = false;
+        mouse_press_owner[x] = nullptr;
+      }
     }
+    for (const auto &[client_key, held] : input->keys) {
+      release_key(held);
+    }
+    input->keys.clear();
+    input->shortcutFlags = 0;
+    input->guide_key_pressed = false;
+    for (auto &gamepad : input->gamepads) {
+      reset_gamepad(gamepad);
+    }
+    input->allocated_gamepads.store(0, std::memory_order_relaxed);
+    if (input->client_context) {
+      platf::touch_input_t touch {};
+      touch.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
+      platf::touch_update(input->client_context.get(), {}, touch);
+      platf::pen_input_t pen {};
+      pen.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
+      platf::pen_update(input->client_context.get(), {}, pen);
+      // Destroy per-client devices and cancel backend repeat timers on the
+      // same worker, even if transport callbacks still retain input_t.
+      input->client_context.reset();
+    }
+    input->accumulated_vscroll_delta = 0;
+    input->accumulated_hscroll_delta = 0;
+    BOOST_LOG(debug) << "Released disconnected client's keyboard, mouse, controllers, touch and pen input";
+  }
+
+  void reset(std::shared_ptr<input_t> &input) {
+    if (!input) return;
     {
       std::lock_guard<std::mutex> lg(input->input_queue_lock);
-      if (input->input_closed) {
-        return;
-      }
+      if (input->input_closed) return;
       input->input_closed = true;
       input->input_queue.clear();
     }
-
-    // Finish any in-flight packet on the single input worker, then release.
-    // No producer may enqueue another press after the queue is sealed above.
-    task_pool.push([input]() {
-      task_pool.cancel(input->key_press_repeat_id);
-      input->key_press_repeat_id = nullptr;
-      task_pool.cancel(input->mouse_left_button_timeout);
-      input->mouse_left_button_timeout = nullptr;
-      for (int x = 1; x < mouse_press.size(); ++x) {
-        if (mouse_press_owner[x] == input.get()) {
-          platf::button_mouse(platf_input, x, true);
-          mouse_press[x] = false;
-          mouse_press_owner[x] = nullptr;
-        }
-      }
-      for (const auto &[client_key, held] : input->keys) {
-        release_key(held);
-      }
-      input->keys.clear();
-      input->shortcutFlags = 0;
-      input->guide_key_pressed = false;
-      for (auto &gamepad : input->gamepads) {
-        reset_gamepad(gamepad);
-      }
-      input->allocated_gamepads.store(0, std::memory_order_relaxed);
-      if (input->client_context) {
-        platf::touch_input_t touch {};
-        touch.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
-        platf::touch_update(input->client_context.get(), {}, touch);
-        platf::pen_input_t pen {};
-        pen.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
-        platf::pen_update(input->client_context.get(), {}, pen);
-        // Destroy per-client devices and cancel backend repeat timers on the
-        // same worker, even if transport callbacks still retain input_t.
-        input->client_context.reset();
-      }
-      input->accumulated_vscroll_delta = 0;
-      input->accumulated_hscroll_delta = 0;
-      BOOST_LOG(debug) << "Released disconnected client's keyboard, mouse, controllers, touch and pen input";
+    // Finish any in-flight packet before releasing this session's owned state.
+    input_executor.push([input]() {
+      release_input(input);
+      std::lock_guard lock(input_lifecycle_mutex);
+      std::erase(active_inputs, input);
     });
   }
 
   class deinit_t: public platf::deinit_t {
   public:
     ~deinit_t() override {
-      mouse_controller.reset();
-      mouse_backend.reset();
-      platf_input.reset();
+      std::vector<std::shared_ptr<input_t>> inputs;
+      {
+        std::lock_guard lock(input_lifecycle_mutex);
+        accepting_inputs = false;
+        inputs.swap(active_inputs);
+      }
+      for (const auto &input : inputs) {
+        std::lock_guard lock(input->input_queue_lock);
+        input->input_closed = true;
+        input->input_queue.clear();
+      }
+      input_executor.stop([inputs = std::move(inputs)]() {
+        for (const auto &input : inputs) release_input(input);
+        mouse_controller.reset();
+        mouse_backend.reset();
+        platf_input.reset();
+      });
     }
   };
 
@@ -2414,7 +2452,22 @@ namespace input {
     platf_input = platf::input();
     mouse_backend = std::make_unique<platform_mouse_backend_t>(platf_input);
     mouse_controller = std::make_unique<mouse_input::controller_t>(*mouse_backend);
-
+    input_executor.start([]() {
+      platf::set_thread_name("input::worker");
+      platf::adjust_thread_priority(platf::thread_priority_e::high);
+    }, [](std::exception_ptr failure) {
+      try {
+        std::rethrow_exception(failure);
+      } catch (const std::exception &e) {
+        BOOST_LOG(error) << "Input worker callback failed: " << e.what();
+      } catch (...) {
+        BOOST_LOG(error) << "Input worker callback failed";
+      }
+    });
+    {
+      std::lock_guard lock(input_lifecycle_mutex);
+      accepting_inputs = true;
+    }
     return std::make_unique<deinit_t>();
   }
 
@@ -2440,16 +2493,34 @@ namespace input {
       guide_button
     );
     input->persist_gamepads = persist_gamepads;
-    start_input_geometry_refresh(input);
-
-    // Workaround to ensure new frames will be captured when a client connects
-    task_pool.pushDelayed([]() {
-      if (mouse_controller) {
-        mouse_controller->move_relative({1, 1});
-        mouse_controller->move_relative({-1, -1});
+    {
+      std::lock_guard lock(input_lifecycle_mutex);
+      if (!accepting_inputs) {
+        input->input_closed = true;
+        return input;
       }
-    },
-                          100ms);
+      active_inputs.push_back(input);
+      // FIFO admission precedes every packet for this newly returned context.
+      input_executor.push([input]() {
+        {
+          std::lock_guard lock(input->input_queue_lock);
+          if (input->input_closed) return;
+        }
+        input->client_context = platf::allocate_client_input_context(platf_input);
+        start_input_geometry_refresh(input);
+        // Session-scoped capture wakeup; a disconnect must not move the mouse.
+        input_executor.pushDelayed([input]() {
+          {
+            std::lock_guard lock(input->input_queue_lock);
+            if (input->input_closed) return;
+          }
+          if (mouse_controller) {
+            mouse_controller->move_relative({1, 1});
+            mouse_controller->move_relative({-1, -1});
+          }
+        }, 100ms);
+      });
+    }
 
     return input;
   }

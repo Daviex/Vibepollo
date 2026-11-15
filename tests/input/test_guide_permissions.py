@@ -17,6 +17,10 @@ from test_delayed_mouse_release import ROOT, function
 from test_guide_session_config import input_harness
 
 DISPATCH = r'''
+namespace controller_speaker_pcm { constexpr int binding_magic = 0x55000019; }
+using PSS_STEAM_CONTROLLER_ATTRIBUTES_PACKET = struct steam_attributes_packet *;
+void passthrough(std::shared_ptr<input_t> &, PSS_STEAM_CONTROLLER_ATTRIBUTES_PACKET) {}
+
 struct input_header { int magic; };
 using PNV_INPUT_HEADER = input_header *;
 template<int N> struct unused_packet {};

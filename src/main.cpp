@@ -1143,6 +1143,10 @@ int main(int argc, char *argv[]) {
   shutdown_phase_state.set(shutdown_phase::phase_e::task_pool_join);
   task_pool.join();
 
+  // Stop the dedicated input owner and its timers while platform services are
+  // still alive. The guard also performs this join on early-return paths.
+  input_deinit_guard.reset();
+
   // stop system tray
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
   shutdown_phase_state.set(shutdown_phase::phase_e::system_tray_stop);

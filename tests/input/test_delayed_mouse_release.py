@@ -20,7 +20,10 @@ def function(source, signature):
     while depth:
         depth += (source[end] == '{') - (source[end] == '}')
         end += 1
-    return source[start:end]
+    result = source[start:end]
+    if signature == 'void reset(std::shared_ptr<input_t> &input)' and 'void release_input(' in source:
+        result = function(source, 'void release_input(const std::shared_ptr<input_t> &input)') + '\n' + result
+    return result
 
 
 PRELUDE = r'''
@@ -59,6 +62,10 @@ struct worker_t {
     return {id};
   }
   bool cancel(task_id_t id) { return timers.erase(id) != 0; }
+  template<class Function, class Duration, class... Args>
+  timer_t pushDelayedRelease(Function f, Duration delay, Args... args) {
+    return pushDelayed(f, delay, args...);
+  }
   void drain() {
     while (!tasks.empty()) {
       auto f = std::move(tasks.front()); tasks.pop_front(); f();
@@ -70,6 +77,7 @@ struct worker_t {
   }
   void fire() { take_timer()(); }
 } task_pool;
+auto &input_executor = task_pool;
 namespace thread_pool_util { using ThreadPool = worker_t; }
 namespace task_pool_util { using TaskPool = worker_t; }
 #define DISABLE_LEFT_BUTTON_DELAY ((worker_t::task_id_t) 0x01)
@@ -125,6 +133,8 @@ struct gamepad_t {
   std::uint16_t arrival_capabilities = 0;
   std::optional<int> pending_steam_attributes;
   worker_t::task_id_t back_timeout_id = nullptr;
+  worker_t::task_id_t home_release_id = nullptr;
+  bool synthetic_home_down = false;
   platf::gamepad_state_t gamepad_state;
   bool guide_key_down = false;
   button_state_e back_button_state = button_state_e::NONE;
@@ -158,7 +168,7 @@ struct input_t {
   std::vector<gamepad_t> gamepads {16};
   std::atomic_uint32_t allocated_gamepads {0};
   // Stands in for controller_speaker_pcm::owner_bindings: no speaker binding is ever queued here.
-  struct { std::uint64_t take(std::uint8_t) { return 0; } } speaker_bindings;
+  struct { std::uint64_t take(std::uint8_t) { return 0; } template<class T, class F> void bind(const T &, F) {} } speaker_bindings;
   std::unique_ptr<platf::client_input_t> client_context;
   int accumulated_vscroll_delta = 0, accumulated_hscroll_delta = 0;
   worker_t::task_id_t mouse_left_button_timeout = nullptr;
@@ -166,6 +176,9 @@ struct input_t {
   std::mutex input_queue_lock;
   std::list<int> input_queue;
 };
+std::mutex input_lifecycle_mutex;
+bool accepting_inputs = true;
+std::vector<std::shared_ptr<input_t>> active_inputs;
 std::array<std::uint8_t, BUTTON_X2 + 1> mouse_press {};
 std::array<input_t *, BUTTON_X2 + 1> mouse_press_owner {};
 worker_t::task_id_t key_press_repeat_id {};

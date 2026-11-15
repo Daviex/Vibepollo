@@ -214,6 +214,13 @@ int main(int argc, char **argv) {
     key(a, 0x41); task_pool.fire(); disconnect(a);
     expect({{0x41, false, 0}, {0x41, false, 0}, {0x41, true, 0}});
     assert(task_pool.timers.empty());
+  } else if (test == "repeat_after_closed_queue") {
+    config::input.key_repeat_delay = 1ms;
+    key(a, 65);
+    auto count = platf::keyboard_events.size();
+    reset(a); task_pool.fire();
+    assert(platf::keyboard_events.size() == count);
+    task_pool.drain(); assert(platf::keyboard_events.back().release);
   } else if (test == "other_client_repeat_survives") {
     config::input.key_repeat_delay = 10ms;
     key(a, 0x41); disconnect(b); task_pool.fire(); disconnect(a);
@@ -502,13 +509,44 @@ int main(int argc, char **argv) {
     } else if (test == "guide_back_timer_overlap") {
       connect(a, 0, 1, platf::BACK); key(a, 124); task_pool.fire();
       guide(a, true); assert(!(state(a).buttonFlags & platf::BACK));
-      key(a, 124, true); guide(a, false); expect({});
+      key(a, 124, true); guide(a, true); task_pool.fire(); guide(a, false); expect({});
     } else if (test == "guide_back_timer_unchanged") {
       connect(a, 0, 1, platf::BACK); auto first = platf::gamepad_events.size(); task_pool.fire();
+      assert(platf::gamepad_events.size() == first + 2);
+      assert(a->gamepads[0].synthetic_home_down);
+      task_pool.fire();
       assert(platf::gamepad_events.size() == first + 3);
       assert(platf::gamepad_events[first].second.buttonFlags == 0);
       assert(platf::gamepad_events[first + 1].second.buttonFlags == platf::HOME);
       assert(platf::gamepad_events[first + 2].second.buttonFlags == 0); expect({});
+    } else if (test == "guide_back_timer_after_closed_queue") {
+      connect(a, 0, 1, platf::BACK);
+      auto count = platf::gamepad_events.size();
+      reset(a); task_pool.fire();
+      assert(platf::gamepad_events.size() == count);
+      task_pool.drain(); assert(platf::gamepad_events.back().second.buttonFlags == 0);
+    } else if (test == "guide_home_pulse_preserves_new_packets") {
+      connect(a, 0, 1, platf::BACK); task_pool.fire();
+      connect(a, 0, 1, 0x1000);
+      assert(state(a).buttonFlags == (platf::HOME | 0x1000));
+      connect(a, 0, 1, 0); guide(a, true);
+      task_pool.fire(); assert(state(a).buttonFlags == 0);
+    } else if (test == "guide_home_pulse_preserves_native_home") {
+      connect(a, 0, 1, platf::BACK); task_pool.fire();
+      connect(a, 0, 1, platf::HOME | 0x1000);
+      task_pool.fire(); assert(state(a).buttonFlags == (platf::HOME | 0x1000));
+      connect(a, 0, 1, 0); assert(state(a).buttonFlags == 0);
+    } else if (test == "guide_home_pulse_disconnect_cancels_release") {
+      connect(a, 0, 1, platf::BACK); task_pool.fire();
+      assert(a->gamepads[0].synthetic_home_down && task_pool.timers.size() == 1);
+      disconnect(a);
+      assert(task_pool.timers.empty() && !a->gamepads[0].synthetic_home_down);
+      assert(platf::gamepad_events.back().second.buttonFlags == 0);
+    } else if (test == "guide_home_pulse_removed_slot_cancels_release") {
+      connect(a, 0, 1, platf::BACK); task_pool.fire();
+      connect(a, 0, 0);
+      assert(task_pool.timers.empty() && !a->gamepads[0].synthetic_home_down);
+      connect(a, 0, 1, 0x1000); assert(state(a).buttonFlags == 0x1000);
     } else if (test == "guide_disabled_press") {
       connect(a, 0, 1);
       for (bool keyboard_disabled : {false, true}) {

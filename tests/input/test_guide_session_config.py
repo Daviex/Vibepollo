@@ -31,12 +31,18 @@ def config_code(source):
 MAIL = r'''
 using input::guide_button_config_t;
 namespace input { struct touch_port_t {}; }
-namespace platf { using gamepad_feedback_msg_t = int; }
+namespace platf {
+  using gamepad_feedback_msg_t = int;
+  constexpr std::size_t GAMEPAD_FEEDBACK_QUEUE_CAPACITY = 256;
+  std::unique_ptr<client_input_t> allocate_client_input_context(input_t &) {
+    return std::make_unique<client_input_t>();
+  }
+}
 namespace mail { constexpr int touch_port = 0, gamepad_feedback = 1; }
 namespace safe {
   struct mail_raw_t {
     template<class T> int event(int) { return 0; }
-    template<class T> int queue(int) { return 0; }
+    template<class T> int queue(int, std::size_t = 0, bool = false) { return 0; }
   };
   using mail_t = std::shared_ptr<mail_raw_t>;
 }
@@ -126,6 +132,7 @@ def input_harness(source):
   const int guide_button_key;''')
     prelude = prelude.replace('void push(std::function<void()> f) { tasks.push_back(std::move(f)); }', 'template<class F, class... A> void push(F f, A... a) { tasks.push_back([=] { f(a...); }); }')
     extra = re.sub(r'namespace util \{.*?\n\}', '', packet_harness.EXTRA, flags=re.S)
+    extra = re.sub(r'namespace geometry \{.*?\n\}', '', extra, flags=re.S)
     signatures = (
         'void send_gamepad_state(const gamepad_t &gamepad)',
         'short map_keycode(short keycode)',

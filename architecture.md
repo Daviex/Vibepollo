@@ -70,6 +70,37 @@ The main entry (`src/main.cpp`) performs:
    - `std::thread configThread {confighttp::start};` (Web UI + REST + WebRTC signaling)
    - `std::thread rtspThread {rtsp_stream::start};` (classic streaming media/control plane)
 
+### Serialized input execution
+
+Since the 2026-11-15 input latency change, `input::init()` starts a dedicated
+serial executor (`src/input_executor.h`), separate from the global background
+task pool. It requests the platform's high thread priority. Input injection,
+client device creation/release, key repeat, delayed mouse release and geometry
+refresh all use this owner, preserving ordering across shared input state.
+The synthetic Home release alternates with queued work when both are ready, so
+continuous packets cannot indefinitely extend that pulse. Ordinary timers run
+after queued work, allowing an already received release to cancel a repeat or
+Back-to-Home press. A slow platform input call
+can still delay subsequent input; this change isolates background work, not
+every source of delay in Windows or a game.
+
+Back-to-Home emulation holds a separate synthetic Home flag and schedules its
+release after 100 ms rather than sleeping on the input worker. Physical state
+updates and native/keyboard-bound Home remain independent during the pulse.
+Relative movement and scroll batch only when their signed 16-bit sums fit;
+button transitions remain barriers to batching.
+
+Session reset seals admission before queued cleanup. Active contexts remain
+owned until their input state is neutralized on the worker. Shutdown rejects
+new contexts, seals their queues, discards timers, drains admitted work and
+releases devices before destroying the platform backend. The deinitialization
+guard also joins the worker on early-return paths.
+
+This changes neither the Moonlight wire protocol nor the virtual gamepad driver.
+Executor and handler regression tests cover scheduling isolation, ordering,
+timer fairness and shutdown; hardware input-to-game and input-to-photon latency
+still require matched live measurements.
+
 ### Mailbox-based coordination
 
 `src/main.cpp` creates a global mailbox:

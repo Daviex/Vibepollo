@@ -7,6 +7,9 @@ python3 tests/input/test_delayed_mouse_release.py
 python3 tests/input/test_disconnect_release.py
 python3 tests/input/test_browser_disconnect.py
 python3 tests/input/test_peer_state_bridge.py
+python3 tests/input/test_input_executor.py
+python3 tests/input/test_input_lifecycle.py
+python3 tests/input/test_input_batching.py --verify-negative-controls
 ```
 
 These scripts compile the production handlers with a deterministic task worker
@@ -16,6 +19,20 @@ remaps, synthetic modifiers, repeat cancellation, all five mouse buttons,
 controller removal and neutralization, touch/pen device lifetime, late packets,
 independent browser input contexts sharing capture coordinates, and WebRTC
 connection-loss/recovery callbacks.
+
+The executor test uses the production worker with synchronization barriers to
+check FIFO ordering, progress while a separate worker is blocked, timer
+cancellation, Home-release fairness, capture destruction and shutdown. The
+lifecycle test combines that worker with the real allocation/reset/deinit
+bodies and inert OS devices. The batching test uses the real packet handlers
+and protocol headers, including signed overflow and digital-edge barriers;
+its negative controls individually restore each original overflow defect.
+Home pulse tests also verify incoming button updates, native Home ownership
+and disconnect cancellation while the synthetic pulse is active.
+
+These checks establish software behavior, not a measured input-to-game latency
+on a controller, network or display. Compare local and streamed gameplay with
+the same game FPS and controller mapping when checking physical latency.
 
 The scripts do not replace a full platform build or driver-level testing.
 The WebRTC change includes the `third-party/libwebrtc` submodule's C bridge;

@@ -1969,6 +1969,15 @@ if(Python3_Interpreter_FOUND AND SUNSHINE_TEST_GXX)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/unit/test_windows_color_profile.py")
     add_test(NAME regression_delayed_mouse_release
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/input/test_delayed_mouse_release.py")
+    add_test(NAME regression_input_disconnect
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/input/test_disconnect_release.py")
+    foreach(_input_regression IN ITEMS executor lifecycle batching)
+        add_test(NAME regression_input_${_input_regression}
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/input/test_input_${_input_regression}.py"
+                --compiler "${SUNSHINE_TEST_GXX}")
+        set_tests_properties(regression_input_${_input_regression} PROPERTIES LABELS "component" TIMEOUT 60)
+    endforeach()
+    set_tests_properties(regression_input_disconnect PROPERTIES LABELS "component" TIMEOUT 60)
     add_test(NAME regression_windows_absolute_mouse
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/input/test_windows_absolute_mouse.py")
     add_test(NAME regression_windows_mouse_keys
